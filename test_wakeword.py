@@ -7,7 +7,7 @@ model = Model(wakeword_models=["hey_jarvis_v0.1"])
 audio = pyaudio.PyAudio()
 stream = audio.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1280)
 
-print("Listening... say 'Hey Friday' (Ctrl+C to stop)  [model: hey_jarvis until custom model trained]")
+print("Listening... say 'Hey Jarvis' (Ctrl+C to stop)")
 print("Score > 0.5 = detection\n")
 
 try:

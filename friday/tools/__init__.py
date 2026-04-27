@@ -11,6 +11,7 @@ from collections.abc import Iterable
 from friday.tools import (
     apps,
     audio,
+    calculate,
     claude_delegate,
     clipboard,
     files,
@@ -18,6 +19,8 @@ from friday.tools import (
     media,
     memory,
     messaging,
+    scheduler,
+    screen,
     sysmon,
     system,
     utils,
@@ -32,7 +35,7 @@ DOMAIN_MODULES = {
     # Core stays always-on for the live voice agent. It intentionally includes
     # the web/search tools because current-events questions are high-risk if the
     # model cannot reach search in the turn where it needs it.
-    "core": (web, system, utils, apps, messaging, memory, claude_delegate, network, weather, clipboard, sysmon),
+    "core": (web, system, utils, apps, messaging, memory, claude_delegate, network, weather, clipboard, sysmon, screen, scheduler, calculate),
     "media": (media, audio),
     "files": (files,),
     "google": (google_suite,),

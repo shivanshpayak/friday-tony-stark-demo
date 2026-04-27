@@ -14,11 +14,19 @@ def _set_master_volume(level: float) -> str:
     """Set system master volume. level is 0.0 to 1.0."""
     CoInitialize()
     try:
-        devices = AudioUtilities.GetSpeakers()
-        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        volume = cast(interface, POINTER(IAudioEndpointVolume))
+        volume = AudioUtilities.GetSpeakers().EndpointVolume
         volume.SetMasterVolumeLevelScalar(max(0.0, min(1.0, level)), None)
         return f"System volume set to {int(level * 100)}%."
+    finally:
+        CoUninitialize()
+
+
+def _get_master_volume() -> float:
+    """Return system master volume as a fraction 0.0–1.0."""
+    CoInitialize()
+    try:
+        volume = AudioUtilities.GetSpeakers().EndpointVolume
+        return float(volume.GetMasterVolumeLevelScalar())
     finally:
         CoUninitialize()
 
@@ -35,6 +43,22 @@ def _set_app_volume(app_name: str, level: float) -> str:
                 vol.SetMasterVolume(max(0.0, min(1.0, level)), None)
                 return f"{session.Process.name()} volume set to {int(level * 100)}%."
         return f"Couldn't find an audio session for '{app_name}'. It might not be playing anything right now."
+    finally:
+        CoUninitialize()
+
+
+def _get_app_volume(app_name: str) -> tuple[float, str] | None:
+    """Return (level 0.0–1.0, process_name) for the first matching app session,
+    or None if no session was found."""
+    CoInitialize()
+    try:
+        sessions = AudioUtilities.GetAllSessions()
+        needle = app_name.lower()
+        for session in sessions:
+            if session.Process and needle in session.Process.name().lower():
+                vol = session._ctl.QueryInterface(ISimpleAudioVolume)
+                return float(vol.GetMasterVolume()), session.Process.name()
+        return None
     finally:
         CoUninitialize()
 
@@ -85,6 +109,25 @@ def register(mcp: FastMCP):
         if app:
             return _set_app_volume(app, fraction)
         return _set_master_volume(fraction)
+
+    @mcp.tool(name="adjust_volume")
+    def adjust_volume(delta: int, app: str = "") -> str:
+        """Change volume relative to its current level. `delta` is in
+        percentage points: positive raises, negative lowers (e.g. delta=5
+        means "+5%", delta=-10 means "-10%"). If `app` is empty, adjusts
+        system master volume; otherwise adjusts that app's volume.
+        Use when the user says "increase the volume by X", "turn it up a
+        bit", "lower spotify by 20%", etc. Result is clamped to 0-100."""
+        if app:
+            current = _get_app_volume(app)
+            if current is None:
+                return f"Couldn't find an audio session for '{app}'. It might not be playing anything right now."
+            cur_frac, proc_name = current
+            new_frac = max(0.0, min(1.0, cur_frac + delta / 100.0))
+            return _set_app_volume(app, new_frac)
+        cur_frac = _get_master_volume()
+        new_frac = max(0.0, min(1.0, cur_frac + delta / 100.0))
+        return _set_master_volume(new_frac)
 
     @mcp.tool(name="play_pause_media")
     def play_pause_media() -> str:
@@ -167,6 +210,8 @@ def register(mcp: FastMCP):
                         keyboard.send("play/pause media")
                     threading.Thread(target=_delayed_play, daemon=True).start()
                 label = {"track": "track", "playlist": "playlist", "album": "album"}.get(type, type)
+                if type == "track":
+                    return f"Pulled up the {label}, sir — hit play when ready."
                 return f"Found the {label} and started playing it."
             except Exception as e:
                 return f"Failed to auto-play Spotify {type}: {e}"

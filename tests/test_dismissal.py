@@ -6,7 +6,6 @@ DISMISSAL_PHRASES = [
     "that will be all",
     "stand down",
     "go to sleep",
-    "goodbye friday",
     "goodbye jarvis",
 ]
 
@@ -21,7 +20,6 @@ def test_exact_dismissal_phrases():
     assert is_dismissal("that'll be all")
     assert is_dismissal("stand down")
     assert is_dismissal("go to sleep")
-    assert is_dismissal("goodbye friday")
     assert is_dismissal("goodbye jarvis")
 
 
@@ -32,11 +30,11 @@ def test_dismissal_case_insensitive():
 
 
 def test_dismissal_in_sentence():
-    assert is_dismissal("okay friday, that'll be all for tonight")
+    assert is_dismissal("okay jarvis, that'll be all for tonight")
     assert is_dismissal("you can stand down now")
 
 
 def test_non_dismissal():
     assert not is_dismissal("what's the weather")
     assert not is_dismissal("tell me the news")
-    assert not is_dismissal("hello friday")
+    assert not is_dismissal("hello jarvis")

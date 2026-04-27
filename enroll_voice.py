@@ -1,5 +1,5 @@
 """
-FRIDAY Voice Enrollment
+JARVIS Voice Enrollment
 =======================
 Records a short sample of the user's voice and saves a speaker embedding
 that the wake-word gate uses to reject non-user voices (TV, other people).
@@ -26,8 +26,8 @@ CHUNK = 1600  # 100ms
 RECORD_SECONDS = 20
 OUTPUT_PATH = Path(__file__).parent / "voice_embedding.npy"
 PROMPTS = [
-    "Hey Friday, run a diagnostic and tell me how the systems are looking.",
-    "Friday, give me a brief on the world right now, sir.",
+    "Hey Jarvis, run a diagnostic and tell me how the systems are looking.",
+    "Jarvis, give me a brief on the world right now, sir.",
     "Open the world monitor and show me what I'm looking at.",
     "Stand down for now, I'll call you back in a minute.",
     "Talk naturally about what you did today for the rest of the time.",
@@ -66,7 +66,7 @@ def record_clip(seconds: int) -> np.ndarray:
 
 def main():
     print("=" * 60)
-    print("FRIDAY Voice Enrollment")
+    print("JARVIS Voice Enrollment")
     print("=" * 60)
     print()
     print("I'll record ~%d seconds of your voice to build a speaker" % RECORD_SECONDS)

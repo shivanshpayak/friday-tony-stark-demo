@@ -305,7 +305,7 @@ def close_app(name: str) -> str:
 
 def rescan_apps() -> str:
     """Clear the discovery cache and rescan Start Menu. Use after installing
-    something new without restarting Friday."""
+    something new without restarting Jarvis."""
     global _DISCOVERED_READY
     with _DISCOVERY_LOCK:
         _DISCOVERED.clear()
@@ -349,8 +349,8 @@ def register(mcp):
     @mcp.tool(name="rescan_apps")
     def _mcp_rescan_apps() -> str:
         """Rebuild the list of installed apps. Use when the user says they just
-        installed something and Friday says it can't find it, or asks Friday
-        to "refresh apps" / "rescan apps"."""
+        installed something and Jarvis can't find it, or asks to
+        "refresh apps" / "rescan apps"."""
         return rescan_apps()
 
 # Pre-warm the discovery cache in the background when the module loads,

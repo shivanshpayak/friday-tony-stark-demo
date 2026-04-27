@@ -1,5 +1,5 @@
 """
-FRIDAY Launcher — Wake Word Activated Voice Assistant
+JARVIS Launcher — Wake Word Activated Voice Assistant
 =====================================================
 Single entry point that manages:
 1. MCP Server subprocess (always running)
@@ -143,14 +143,14 @@ def _excepthook(exc_type, exc_value, exc_tb):
 
 sys.excepthook = _excepthook
 logger.info("=" * 70)
-logger.info("FRIDAY launcher starting — log file: %s", LOG_FILE)
+logger.info("JARVIS launcher starting — log file: %s", LOG_FILE)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-WAKE_MODEL = "hey_jarvis_v0.1"  # TODO: train custom "hey friday" model via OpenWakeWord Colab notebook
-WAKE_THRESHOLD = 0.7          # was 0.7 — fewer false wakes from background noise
+WAKE_MODEL = "hey_jarvis_v0.1"  # built-in OpenWakeWord model
+WAKE_THRESHOLD = 0.7          # fewer false wakes from background noise
 SILENCE_TIMEOUT = 30.0
 AUDIO_RATE = 16000
 AUDIO_CHUNK = 1280  # 80ms at 16kHz
@@ -562,6 +562,17 @@ class AgentProcess:
             None, self._session_done.wait
         )
 
+    def send_interrupt(self):
+        """Tell the subprocess to interrupt the current in-flight turn."""
+        if not self.alive:
+            return
+        try:
+            assert self._proc and self._proc.stdin
+            self._proc.stdin.write("INTERRUPT\n")
+            self._proc.stdin.flush()
+        except Exception as e:
+            logger.error("Failed to write INTERRUPT: %s", e)
+
     def stop(self):
         """Gracefully shut down the subprocess."""
         if not self.alive:
@@ -597,7 +608,7 @@ async def launcher_loop():
     overlay.start()
 
     # ---- Global hotkeys --------------------------------------------------
-    # Registered on the OS hook, so they fire even when FRIDAY isn't focused.
+    # Registered on the OS hook, so they fire even when JARVIS isn't focused.
 
     def _teardown():
         """Best-effort shutdown of every resource we own."""
@@ -635,7 +646,7 @@ async def launcher_loop():
                 ),
                 close_fds=True,
             )
-            logger.info("New FRIDAY instance spawned — dying now")
+            logger.info("New JARVIS instance spawned — dying now")
         except Exception as e:
             logger.error("Restart spawn failed: %s", e)
             return
@@ -644,13 +655,13 @@ async def launcher_loop():
 
     try:
         keyboard.add_hotkey(KILL_HOTKEY, _kill_switch)
-        logger.info("Kill switch armed → press %s to terminate FRIDAY", KILL_HOTKEY)
+        logger.info("Kill switch armed → press %s to terminate JARVIS", KILL_HOTKEY)
     except Exception as e:
         logger.warning("Could not register kill-switch hotkey: %s", e)
 
     try:
         keyboard.add_hotkey(RESTART_HOTKEY, _restart_switch)
-        logger.info("Restart armed → press %s to reload FRIDAY with new code",
+        logger.info("Restart armed → press %s to reload JARVIS with new code",
                     RESTART_HOTKEY)
     except Exception as e:
         logger.warning("Could not register restart hotkey: %s", e)
@@ -663,8 +674,14 @@ async def launcher_loop():
     ptt_event = threading.Event()
 
     def _ptt_pressed():
-        logger.info("PTT pressed (%s)", PTT_HOTKEY)
-        ptt_event.set()
+        # Context-aware: ACTIVE → interrupt the in-flight turn; otherwise → wake.
+        # `state` is closure-captured from launcher_loop and updated by reference.
+        if state == State.ACTIVE:
+            logger.info("PTT pressed (%s) — interrupting active turn", PTT_HOTKEY)
+            agent.send_interrupt()
+        else:
+            logger.info("PTT pressed (%s) — wake", PTT_HOTKEY)
+            ptt_event.set()
 
     try:
         keyboard.add_hotkey(PTT_HOTKEY, _ptt_pressed)
@@ -687,7 +704,7 @@ async def launcher_loop():
 
     wakeword.start_stream()
     state = State.SLEEPING
-    logger.info("FRIDAY launcher ready — say 'Hey Friday' to activate")
+    logger.info("JARVIS launcher ready — say 'Hey Jarvis' to activate")
 
     try:
         while True:
@@ -695,7 +712,7 @@ async def launcher_loop():
                 # If the agent subprocess died between sessions, respawn it.
                 if not agent.alive:
                     logger.warning("Agent subprocess died — respawning…")
-                    overlay.show_loading("Rebooting FRIDAY...")
+                    overlay.show_loading("Rebooting JARVIS...")
                     wakeword.stop_stream()
                     agent.start()
                     await agent.wait_ready(timeout=60.0)
@@ -765,7 +782,7 @@ async def launcher_loop():
         overlay.stop()
         wakeword.cleanup()
         agent.stop()
-        logger.info("FRIDAY launcher stopped")
+        logger.info("JARVIS launcher stopped")
 
 
 def main():

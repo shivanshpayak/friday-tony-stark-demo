@@ -5,11 +5,11 @@ Data resources — expose static content or dynamic data via MCP resources.
 
 def register(mcp):
 
-    @mcp.resource("friday://info")
+    @mcp.resource("jarvis://info")
     def server_info() -> str:
         """Returns basic info about this MCP server."""
         return (
-            "Friday MCP Server\n"
-            "A Tony Stark-inspired AI assistant.\n"
+            "Jarvis MCP Server\n"
+            "A personal AI assistant.\n"
             "Built with FastMCP."
         )

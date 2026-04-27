@@ -1,5 +1,5 @@
 """
-Friday MCP Server — Entry Point
+JARVIS MCP Server — Entry Point
 Default transport is stdio (used by agent_friday.py as an embedded subprocess).
 Pass --sse to expose the same tools over SSE for external clients.
 
@@ -18,11 +18,11 @@ from friday.resources import register_all_resources
 
 # Create the MCP server instance
 mcp = FastMCP(
-    name="Friday",
+    name="Jarvis",
     instructions=(
-        "You are Friday, a Tony Stark-style AI assistant. "
+        "You are Jarvis, a personal AI assistant. "
         "You have access to a set of tools to help the user. "
-        "Be concise, accurate, and a little witty."
+        "Be concise, accurate, and direct."
     ),
 )
 

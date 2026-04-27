@@ -1,5 +1,5 @@
 """
-FRIDAY – Voice Agent
+JARVIS – Voice Agent
 ====================
 Iron Man-style voice assistant powered by LiveKit Agents SDK.
 All config lives in friday/config.py, providers in friday/providers.py.
@@ -61,7 +61,7 @@ from friday.config import (
     MAX_HISTORY_ITEMS, logger,
 )
 from friday.providers import build_stt, build_llm, build_tts
-from friday.routing import LocalDomainToolPool, classify_domains
+from friday.routing import LocalDomainToolPool
 from friday.speaker_gate import get_speaker_gate
 
 # Repo root — used to locate server.py when spawning the MCP subprocess.
@@ -121,11 +121,10 @@ class FridayAgent(Agent):
     (see server.py + friday/tools/). This class keeps voice-specific
     concerns: speaker gating, history trimming, streaming signals, greeting."""
 
-    def __init__(self, stt, llm, tts, *, tool_pool: LocalDomainToolPool, vad=None) -> None:
+    def __init__(self, stt, llm, tts, vad=None) -> None:
         from friday.tools.memory import get_memories_prompt
         memories = get_memories_prompt()
         full_prompt = SYSTEM_PROMPT + ("\n\n" + memories if memories else "")
-        self._tool_pool = tool_pool
         super().__init__(
             instructions=full_prompt,
             stt=stt, llm=llm, tts=tts,
@@ -137,13 +136,6 @@ class FridayAgent(Agent):
                 min_silence_duration=0.5,
             ),
         )
-
-    @staticmethod
-    def _latest_user_text(chat_ctx) -> str:
-        for item in reversed(chat_ctx.items):
-            if getattr(item, "type", None) == "message" and getattr(item, "role", None) == "user":
-                return (getattr(item, "text_content", None) or "").strip()
-        return ""
 
     # -- Speaker-gated STT ------------------------------------------------
 
@@ -195,18 +187,14 @@ class FridayAgent(Agent):
     # -- LLM with history trimming + optional scrubber --------------------
 
     async def llm_node(self, chat_ctx, tools, model_settings):
-        """Trim history and optionally scrub tool-call leaks (llama only)."""
+        """Trim history and optionally scrub tool-call leaks (llama only).
+
+        Tool surface: the framework hands us the full toolset every turn
+        (no domain filtering). Frontier LLMs handle ~100 tools well; revisit
+        with semantic retrieval if/when we cross that threshold.
+        """
         if MAX_HISTORY_ITEMS and len(chat_ctx.items) > MAX_HISTORY_ITEMS:
             chat_ctx = chat_ctx.truncate(max_items=MAX_HISTORY_ITEMS)
-
-        user_text = self._latest_user_text(chat_ctx)
-        active_domains = classify_domains(user_text)
-        active_tools = await self._tool_pool.get_toolsets(active_domains)
-        logger.info(
-            "Tool routing: domains=%s for user=%r",
-            ",".join(active_domains),
-            user_text[:120],
-        )
 
         # Signal the launcher that we're thinking
         print("PROCESSING", flush=True)
@@ -215,7 +203,7 @@ class FridayAgent(Agent):
         scrubber = _ToolLeakScrubber() if use_scrubber else None
         first_content = True
 
-        async for chunk in Agent.default.llm_node(self, chat_ctx, active_tools, model_settings):
+        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
             # Signal when first real content arrives (TTS will start speaking)
             if (
                 first_content
@@ -268,16 +256,33 @@ def _endpointing_delay() -> float:
     return {"sarvam": 0.07, "whisper": 0.3}.get(STT_PROVIDER, 0.1)
 
 
-async def _wait_for_stdin_command() -> str:
-    """Block until START or QUIT arrives on stdin."""
+async def _stdin_dispatch_loop(session, cmd_queue: asyncio.Queue) -> None:
+    """Read stdin lines and route them.
+
+    START / QUIT go to the activation queue (consumed by the activation
+    loop). INTERRUPT is handled inline by calling `session.interrupt()`
+    so it can fire mid-turn without waiting for the activation loop to
+    finish whatever it's currently awaiting.
+    """
     loop = asyncio.get_event_loop()
     while True:
         line = await loop.run_in_executor(None, sys.stdin.readline)
         if not line:
-            return ""
+            await cmd_queue.put("QUIT")
+            return
         cmd = line.strip().upper()
-        if cmd in ("START", "QUIT"):
-            return cmd
+        if cmd == "INTERRUPT":
+            try:
+                # force=True bypasses the per-speech `_allow_interruptions`
+                # gate, which is False because we set InterruptionOptions(
+                # enabled=False) to disable VERBAL interruption. Manual
+                # keybind interrupts must override that gate.
+                session.interrupt(force=True)
+                logger.info("INTERRUPT received — session.interrupt(force=True) called")
+            except Exception as e:
+                logger.warning("session.interrupt() failed: %s", e)
+        elif cmd in ("START", "QUIT"):
+            await cmd_queue.put(cmd)
 
 
 _READY_LINE_INSTRUCTIONS = (
@@ -341,7 +346,7 @@ async def entrypoint(ctx: JobContext) -> None:
     tearing down the session. On re-activation we re-enable audio
     and generate a fresh greeting on the same live session.
     """
-    logger.info("FRIDAY online — room: %s | STT=%s | LLM=%s | TTS=%s",
+    logger.info("JARVIS online — room: %s | STT=%s | LLM=%s | TTS=%s",
                 ctx.room.name, STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER)
 
     # Warm-up: build providers + speaker gate in parallel. Each factory
@@ -373,14 +378,9 @@ async def entrypoint(ctx: JobContext) -> None:
                 min_delay=_endpointing_delay(),
                 max_delay=0.8,
             ),
-            interruption=InterruptionOptions(
-                enabled=True,
-                mode="adaptive",
-                min_duration=0.5,
-                min_words=1,
-                resume_false_interruption=True,
-                false_interruption_timeout=3.0,
-            ),
+            # Verbal interruption disabled — only the launcher's PTT keybind
+            # interrupts an in-flight turn (via INTERRUPT stdin command below).
+            interruption=InterruptionOptions(enabled=False),
         ),
         tools=[core_toolset],
         max_tool_steps=3,
@@ -445,6 +445,27 @@ async def entrypoint(ctx: JobContext) -> None:
             
     set_completion_callback(_on_task_finished)
 
+    # -----------------------------------------------------------------------
+    # Scheduler — fires due timers and reminders via TTS
+    # -----------------------------------------------------------------------
+    from friday.scheduling import set_fire_callback, start_scheduler
+
+    async def _on_scheduled_fire(item):
+        try:
+            logger.info("Scheduled %s fired (%s): %s", item.kind, item.id, item.message)
+            await session.generate_reply(
+                instructions=(
+                    f"A scheduled {item.kind} just went off. "
+                    f"Speak this to the user verbatim, then stop: '{item.message}'"
+                ),
+                tool_choice="none",
+            )
+        except Exception as e:
+            logger.error("Scheduled fire callback failed: %s", e)
+
+    set_fire_callback(_on_scheduled_fire)
+    start_scheduler()
+
     # Dismissal event — set when the user says goodbye, cleared on re-activation.
     # Start in "dismissed" state so the activation loop's first iteration
     # waits for a START command instead of immediately looping.
@@ -479,7 +500,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # first "hey friday". Silence the mic immediately — we don't want
     # transcripts landing in the LLM before the user actually wakes it.
     await session.start(
-        agent=FridayAgent(stt=stt_inst, llm=llm_inst, tts=tts_inst, tool_pool=tool_pool),
+        agent=FridayAgent(stt=stt_inst, llm=llm_inst, tts=tts_inst),
         room=ctx.room,
     )
     try:
@@ -489,10 +510,14 @@ async def entrypoint(ctx: JobContext) -> None:
     logger.info("Session pre-warmed, audio gated off — awaiting first START")
     print("FRIDAY_READY", flush=True)
 
+    # ---- Stdin dispatcher: handles START/QUIT (queued) and INTERRUPT (inline)
+    cmd_queue: asyncio.Queue = asyncio.Queue()
+    asyncio.create_task(_stdin_dispatch_loop(session, cmd_queue))
+
     # ---- Activation loop (first START + every subsequent one use the same path) ----
     while True:
         logger.info("Waiting for START command on stdin…")
-        cmd = await _wait_for_stdin_command()
+        cmd = await cmd_queue.get()
         if cmd != "START":
             logger.info("Received %r — shutting down", cmd or "EOF")
             break
@@ -517,17 +542,12 @@ async def entrypoint(ctx: JobContext) -> None:
             logger.warning("Re-activation ready line failed: %s", e)
 
         # Enable mic after the ready line so the agent doesn't hear itself.
-        # In console mode, don't enable audio since there's no audio input.
-        if ctx.room.name != "console":
-            try:
-                session.input.set_audio_enabled(True)
-                logger.info("Audio input enabled — listening for user speech")
-                print("SESSION_LISTENING", flush=True)
-            except Exception as e:
-                logger.warning("Failed to enable audio input: %s", e)
-        else:
-            logger.info("Console mode — skipping audio input enable")
+        try:
+            session.input.set_audio_enabled(True)
+            logger.info("Audio input enabled — listening for user speech")
             print("SESSION_LISTENING", flush=True)
+        except Exception as e:
+            logger.warning("Failed to enable audio input: %s", e)
 
         # Stay active until user dismisses ("that'll be all", etc.)
         await dismissed.wait()

@@ -375,7 +375,7 @@ def register(mcp):
         overshoot and steady-state error → adjusts values → repeats.
         Stops early when the response is good enough.
 
-        This is a background task — FRIDAY will report results when done.
+        This is a background task — JARVIS will report results when done.
 
         Args:
             robot_ip: RoboRIO IP (e.g. '10.94.77.2').

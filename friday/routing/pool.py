@@ -6,8 +6,19 @@ from pathlib import Path
 
 from livekit.agents.llm import Toolset
 from livekit.agents.llm.mcp import MCPServerStdio, MCPToolset
+from livekit.agents.llm.tool_context import (
+    get_function_info,
+    get_raw_function_info,
+    is_raw_function_tool,
+)
 
 from friday.routing.domains import DOMAINS
+
+
+def _tool_name(t) -> str:
+    if is_raw_function_tool(t):
+        return get_raw_function_info(t).name
+    return get_function_info(t).name
 
 
 # Maps each domain to the tool names it owns. Built once at import from the
@@ -38,7 +49,7 @@ class _FilteredToolset(Toolset):
     def __init__(self, *, source: MCPToolset, allowed_names: set[str]) -> None:
         # Don't call super().__init__ with tools — we set _tools directly
         super().__init__(id=f"{source.id}-filtered")
-        self._tools = [t for t in source.tools if t.name in allowed_names]
+        self._tools = [t for t in source.tools if _tool_name(t) in allowed_names]
 
     async def setup(self) -> _FilteredToolset:
         # Tools are already initialised on the source toolset — nothing to do.
@@ -64,7 +75,7 @@ class LocalDomainToolPool:
 
     def _create_toolset(self) -> MCPToolset:
         return MCPToolset(
-            id="friday-all",
+            id="jarvis-all",
             mcp_server=MCPServerStdio(
                 command=sys.executable,
                 args=[str(self._repo_root / "server.py")],

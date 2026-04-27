@@ -8,7 +8,7 @@ from .models import TaskStep
 logger = logging.getLogger("friday-agent")
 
 _PLANNER_PROMPT = f"""
-You are the FRIDAY Planner. Break down the user's goal into a maximum of {MAX_PLAN_STEPS} steps.
+You are the JARVIS Planner. Break down the user's goal into a maximum of {MAX_PLAN_STEPS} steps.
 Provide the steps formatted EXACTLY as a JSON array of strings. Do not provide any other text.
 Example: ["Search for topic X", "Summarize results"]
 Goal: {{goal}}

@@ -4,7 +4,7 @@ Headless Claude CLI delegation — Phase 6b.
 Launches `claude -p "<prompt>"` as a background subprocess with file-write
 permissions scoped to `runtime/claude_output/`.  Writes the result to a task
 JSON so the file-watcher in service.py fires the completion callback and
-FRIDAY speaks a summary of what Claude did.
+Jarvis speaks a summary of what Claude did.
 """
 
 import logging
@@ -145,7 +145,7 @@ def register(mcp):
         """Delegate a complex question or task to Claude Code running in the
         background. Use this for deep analysis, code generation, research
         synthesis, or anything that benefits from Claude's reasoning.
-        FRIDAY will speak the result when Claude finishes."""
+        Jarvis will speak the result when Claude finishes."""
 
         task_id = f"claude_{datetime.now().strftime('%Y%m%d')}_{uuid4().hex[:6]}"
 

@@ -1,5 +1,5 @@
 """
-Install/uninstall FRIDAY as a Windows startup task.
+Install/uninstall JARVIS as a Windows startup task.
 
 Usage:
     python install_startup.py install
@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-TASK_NAME = "FRIDAY Voice Assistant"
+TASK_NAME = "JARVIS Voice Assistant"
 PROJECT_DIR = Path(__file__).parent.resolve()
 # Use pythonw to avoid a console window
 PYTHON_EXE = Path(sys.executable).parent / "pythonw.exe"

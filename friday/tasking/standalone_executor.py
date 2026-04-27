@@ -14,7 +14,7 @@ from friday.tasking.store import load_task, save_task
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 async def execute_in_terminal(task_id: str):
-    print(f"\033[96m[FRIDAY SUB-ROUTINE ONLINE]\033[0m")
+    print(f"\033[96m[JARVIS SUB-ROUTINE ONLINE]\033[0m")
     print(f"Task ID: {task_id}")
     
     task = load_task(task_id)
@@ -43,7 +43,7 @@ async def execute_in_terminal(task_id: str):
     
     llm_idx = build_llm(mode="planner")
     ctx = llm.ChatContext()
-    ctx.append(role="system", content="You are an autonomous sub-routine agent spawned by FRIDAY to execute a complex coding or logical task in the background. You have access to her tool suite. DO NOT ask the user questions, as you are a headless background agent. DO work step by step, utilizing your tools. When you are finished, output a concise final summary of what you did.")
+    ctx.append(role="system", content="You are an autonomous sub-routine agent spawned by JARVIS to execute a complex coding or logical task in the background. You have access to his tool suite. DO NOT ask the user questions, as you are a headless background agent. DO work step by step, utilizing your tools. When you are finished, output a concise final summary of what you did.")
     ctx.append(role="user", content=f"Target Goal: {task.goal}")
     
     response_text = ""
