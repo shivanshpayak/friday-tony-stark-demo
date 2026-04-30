@@ -44,6 +44,10 @@ _PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
 _PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
 _ProcessPowerThrottling = 4
 
+# Priority classes — ABOVE_NORMAL keeps audio/VAD threads scheduled promptly
+# under load without starving foreground apps the way HIGH_PRIORITY would.
+_ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
+
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
 _kernel32.SetProcessInformation.argtypes = [
@@ -57,6 +61,18 @@ _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 _kernel32.OpenProcess.restype = wintypes.HANDLE
 _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 _kernel32.CloseHandle.restype = wintypes.BOOL
+_kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+_kernel32.SetPriorityClass.restype = wintypes.BOOL
+
+
+def _bump_priority(process_handle) -> bool:
+    """Raise process to ABOVE_NORMAL so the audio thread stays scheduled."""
+    try:
+        return bool(_kernel32.SetPriorityClass(
+            process_handle, _ABOVE_NORMAL_PRIORITY_CLASS,
+        ))
+    except Exception:
+        return False
 
 
 class _POWER_THROTTLING_STATE(ctypes.Structure):
@@ -466,6 +482,9 @@ class AgentProcess:
                      self._proc.pid)
         # Opt the child out of Windows EcoQoS too — it inherits the throttle
         # bit from us inconsistently, so set it explicitly via OpenProcess.
+        # Also bump priority to ABOVE_NORMAL so VAD/STT threads stay scheduled
+        # promptly under memory pressure (paged-out ONNX inference is what
+        # produces the "VAD slower than realtime" warnings).
         try:
             PROCESS_SET_INFORMATION = 0x0200
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -475,9 +494,11 @@ class AgentProcess:
             )
             if h:
                 _disable_power_throttling(h)
+                if _bump_priority(h):
+                    logger.info("Agent priority bumped to ABOVE_NORMAL")
                 _kernel32.CloseHandle(h)
         except Exception as e:
-            logger.debug("Could not unthrottle child process: %s", e)
+            logger.debug("Could not unthrottle/prioritize child process: %s", e)
         self._reader_thread = threading.Thread(
             target=self._read_stdout, daemon=True
         )
@@ -574,9 +595,17 @@ class AgentProcess:
             logger.error("Failed to write INTERRUPT: %s", e)
 
     def stop(self):
-        """Gracefully shut down the subprocess."""
+        """Gracefully shut down the subprocess and its entire descendant tree.
+
+        The agent spawns an MCP server (server.py) as a child, which may itself
+        spawn task-executor grandchildren. subprocess.terminate() only kills the
+        immediate process — descendants get reparented and become multi-GB
+        orphans that accumulate across restarts. Use taskkill /T /F to wipe
+        the whole tree for sure.
+        """
         if not self.alive:
             return
+        pid = self._proc.pid
         try:
             assert self._proc and self._proc.stdin
             self._proc.stdin.write("QUIT\n")
@@ -586,9 +615,18 @@ class AgentProcess:
         try:
             self._proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            self._proc.terminate()
-            self._proc.wait(timeout=3)
-        logger.info("Agent subprocess stopped")
+            pass
+        # Even after a graceful exit, MCP children sometimes outlive their
+        # parent on Windows. Hard-kill the entire tree to be sure.
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except Exception as e:
+            logger.warning("taskkill /T failed for PID %d: %s", pid, e)
+        logger.info("Agent subprocess stopped (tree killed)")
 
 
 async def launcher_loop():

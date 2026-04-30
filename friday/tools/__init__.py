@@ -16,6 +16,7 @@ from friday.tools import (
     clipboard,
     files,
     google_suite,
+    maps,
     media,
     memory,
     messaging,
@@ -35,7 +36,7 @@ DOMAIN_MODULES = {
     # Core stays always-on for the live voice agent. It intentionally includes
     # the web/search tools because current-events questions are high-risk if the
     # model cannot reach search in the turn where it needs it.
-    "core": (web, system, utils, apps, messaging, memory, claude_delegate, network, weather, clipboard, sysmon, screen, scheduler, calculate),
+    "core": (web, system, utils, apps, messaging, memory, claude_delegate, network, weather, clipboard, sysmon, screen, scheduler, calculate, maps),
     "media": (media, audio),
     "files": (files,),
     "google": (google_suite,),

@@ -97,11 +97,11 @@ This is the single top-level to-do list for the project. The sections below expa
 - ~~Memories injected into system prompt at agent init.~~
 - **Still possible:** semantic search over memories, memory decay/relevance scoring.
 
-15. Ship Phase 12 weather.
-- Free API (open-meteo or WeatherAPI.com), no auth required.
-- Current conditions + forecast. "What's the weather?" / "Will it rain tomorrow?"
-- Use IP geolocation for default location, accept city names for anywhere else.
-- Fast path — should feel instant.
+15. ~~Ship Phase 12 weather.~~ **Done (2026-04-29).**
+- ~~Free API (open-meteo or WeatherAPI.com), no auth required.~~ Implemented with Open-Meteo + IP geolocation fallback.
+- ~~Current conditions + forecast.~~ `get_weather` and `get_forecast` in `friday/tools/weather.py`.
+- ~~Use IP geolocation for default location, accept city names for anywhere else.~~
+- ~~Fast path — should feel instant.~~
 
 16. Ship Phase 13 unit conversion, math, and translation.
 - "How many pounds is 80 kilos?" / "What's 20% of 350?"
@@ -109,25 +109,26 @@ This is the single top-level to-do list for the project. The sections below expa
 - Can be handled by the LLM natively — no tool needed for most cases.
 - Add a `calculate` tool only if precision matters (eval-based, not LLM math).
 
-17. Ship Phase 14 clipboard integration.
-- "Copy that" / "Read what's in my clipboard" / "Paste this into..."
-- Windows `win32clipboard` API — trivial to implement.
-- Fast path, no confirmation needed for read. Write could auto-copy tool results.
+17. ~~Ship Phase 14 clipboard integration.~~ **Done (2026-04-29).**
+- ~~"Copy that" / "Read what's in my clipboard" / "Paste this into..."~~
+- ~~Windows clipboard API.~~ `read_clipboard` + `write_clipboard` in `friday/tools/clipboard.py`.
+- ~~Fast path, no confirmation needed for read.~~
 
-18. Ship Phase 15 system monitoring.
-- "How's my CPU?" / "Am I running low on storage?" / "What's eating my RAM?"
-- `psutil` for CPU, RAM, disk, battery, top processes.
-- Fast path — instant response.
+18. ~~Ship Phase 15 system monitoring.~~ **Done (2026-04-29).**
+- ~~"How's my CPU?" / "Am I running low on storage?" / "What's eating my RAM?"~~
+- ~~`psutil` for CPU, RAM, disk, battery, top processes.~~ Implemented in `system_status` (`friday/tools/sysmon.py`).
+- ~~Fast path — instant response.~~
 
-19. Ship Phase 16 timers and alarms.
-- "Set a timer for 10 minutes" / "Wake me up at 7am."
-- In-process async timers with chime/TTS callback on expiry.
-- Need a persistent store for alarms that survive restarts.
-- "Cancel my timer" / "How much time is left?"
+19. ~~Ship Phase 16 timers and alarms.~~ **Basic version done (2026-04-29).**
+- ~~"Set a timer for 10 minutes" / "Wake me up at 7am."~~
+- ~~In-process async timers with TTS callback on expiry.~~ `set_timer` + scheduler callback loop implemented.
+- ~~Need a persistent store for alarms that survive restarts.~~ JSON-backed store in `friday/scheduling/store.py`.
+- ~~"Cancel my timer"~~ supported via `cancel_scheduled`.
+- **Still missing:** richer natural-language time parsing and explicit "time left" query tool.
 
-20. Ship Phase 17 reminders.
-- "Remind me to call John at 3pm" / "Remind me to buy milk when I get home."
-- Time-based reminders: scheduled task with TTS callback (similar to timers).
+20. ~~Ship Phase 17 reminders.~~ **Basic version done (2026-04-29).**
+- ~~"Remind me to call John at 3pm"~~ (via `set_reminder` with ISO timestamp).
+- ~~Time-based reminders: scheduled task with TTS callback (similar to timers).~~
 - Location-based reminders: future — needs phone GPS bridge.
 - Could integrate with Google Tasks API for persistence + cross-device sync.
 
@@ -137,11 +138,11 @@ This is the single top-level to-do list for the project. The sections below expa
 - Very JARVIS — situational awareness of what the user is looking at.
 - Fast path for capture, slow path for vision analysis (~2-3s).
 
-22. Ship Phase 19 maps and navigation.
-- "How long to get to the airport?" / "Navigate to the nearest coffee shop."
-- Google Maps MCP or direct Directions API.
-- Return spoken ETA + traffic summary, optionally open Google Maps in browser.
-- Needs API key.
+22. ~~Ship Phase 19 maps and navigation.~~ **Done (2026-04-29).**
+- ~~"How long to get to the airport?" / "Navigate to the nearest coffee shop."~~
+- ~~Google Maps MCP or direct Directions API.~~ Implemented direct Google Maps Platform calls in `friday/tools/maps.py`.
+- ~~Return spoken ETA + traffic summary, optionally open Google Maps in browser.~~
+- ~~Needs API key.~~ Uses `GOOGLE_MAPS_API_KEY` with optional `HOME_ADDRESS`.
 
 23. Ship Phase 20 package tracking.
 - "Where's my Amazon order?" / "Track my package."
@@ -730,7 +731,12 @@ and FRIDAY stays conversationally responsive instead of hanging on one long repl
 - ~~Task completion callback~~ — Done (2026-04-19). File-watcher polls task JSONs and fires `_on_task_finished`.
 - **Phase 3 home bridge** — no Home Assistant integration yet.
 - ~~Phase 6b headless ask_claude~~ — Done (2026-04-19). `ask_claude` tool delegates to Claude CLI in background.
-- **Phase 7 file write/move/delete** — confirmation flow needed first.
+- ~~Phase 7 file write/move/delete~~ — Done (2026-04-19).
+- ~~Phase 12 weather~~ — Done (`friday/tools/weather.py`).
+- ~~Phase 14 clipboard~~ — Done (`friday/tools/clipboard.py`).
+- ~~Phase 15 system monitoring~~ — Done (`friday/tools/sysmon.py`).
+- ~~Phase 16/17 scheduler (timers + reminders, basic)~~ — Done (`friday/tools/scheduler.py` + `friday/scheduling/`).
+- ~~Phase 19 maps~~ — Done (`friday/tools/maps.py`).
 - External bridges (phone, Telegram, LAN) can attach to the same tool surface via `server.py --sse` or `--streamable-http` once the local surface is stable.
 
 ---
@@ -790,9 +796,9 @@ Play/pause/skip and URI-based track search work. Volume, current-track query, an
 
 ~~6b (headless Claude CLI) done (2026-04-19).~~ `ask_claude(prompt)` in `friday/tools/claude_delegate.py` runs `claude -p` in a background thread, writes the result to a task JSON, and the file-watcher fires the completion callback so FRIDAY speaks the answer.
 
-### Phase 7 - File write / move / delete
+### ~~Phase 7~~ - File write / move / delete — Done (2026-04-19)
 
-Only after confirmation flow is solid.
+Confirmation-gated file write/move/delete landed in `friday/tools/files.py` and stays bounded by `FRIDAY_FILE_ROOTS`.
 
 ### Phase 8 - WhatsApp Web
 
@@ -806,9 +812,9 @@ High risk, high variance in latency, always task-oriented.
 
 Telegram, Discord, or LAN bridge after the local tool surface is stable.
 
-### Phase 11 - Memory
+### ~~Phase 11~~ - Memory — Basic done (2026-04-19)
 
-Only after base responsiveness is good. Memory should improve continuity, not add delay to each turn.
+Persistent memory (`runtime/memory.json`) is live through `remember`, `forget`, and `list_memories`.
 
 ---
 
@@ -826,28 +832,27 @@ Ordered by implementation ease (simplest first), grouped by status.
 7. File write, move, delete
 8. Memory (basic JSON)
 9. Domain-based tool routing
+10. Weather (current + forecast)
+11. Clipboard (read/write)
+12. System monitoring (`system_status`)
+13. Timers + reminders (basic scheduler)
+14. Maps and navigation (ETA + directions + nearby place)
 
 ### Next up (easiest to hardest)
-10. Weather — free API, no auth, fast path, ~30 min
-11. Unit conversion / math / translation — mostly LLM-native, optional tool, ~15 min
-12. Clipboard — `win32clipboard`, read/write, ~30 min
-13. System monitoring — `psutil`, fast path, ~45 min
-14. Timers and alarms — async timers + chime callback, ~2 hrs
-15. Reminders — scheduled callbacks + optional Google Tasks sync, ~2 hrs
-16. Screenshot / screen reading — `ImageGrab` + Gemini vision, ~1 hr
+15. Unit conversion / math / translation — mostly LLM-native; `calculate` is already available when precision matters
+16. Screenshot / screen reading — `read_screen` is implemented; polish + prompt handling remains
 17. Shell with confirmation — allowlists + task mode, ~3 hrs
-18. Maps / navigation — Google Maps API, needs key, ~2 hrs
-19. WhatsApp Web — browser automation, brittle, ~4 hrs
-20. Remote bridge (Telegram/Discord/LAN) — reuse tool surface, ~4 hrs
-21. Package tracking — Gmail search + carrier APIs, multi-step, ~4 hrs
-22. Proactive alerts — background polling loop, careful UX, ~6 hrs
-23. Multi-step routines — depends on home bridge + timers, ~4 hrs
-24. Home bridge (Home Assistant) — needs HA hardware, ~4 hrs
-25. Phone calls (Spix) — external service, conversation scripting, ~8 hrs
-26. Tesla / IoT / Roomba — needs devices + credentials, ~4 hrs
-27. Browser automation (Playwright) — powerful but brittle, ~8 hrs
-28. Multi-device support — split-brain architecture, ~weeks
-29. Semantic memory upgrade — vector search, decay scoring, ~6 hrs
+18. WhatsApp Web — browser automation, brittle, ~4 hrs
+19. Remote bridge (Telegram/Discord/LAN) — reuse tool surface, ~4 hrs
+20. Package tracking — Gmail search + carrier APIs, multi-step, ~4 hrs
+21. Proactive alerts — background polling loop, careful UX, ~6 hrs
+22. Multi-step routines — depends on home bridge + scheduler primitives, ~4 hrs
+23. Home bridge (Home Assistant) — needs HA hardware, ~4 hrs
+24. Phone calls (Spix) — external service, conversation scripting, ~8 hrs
+25. Tesla / IoT / Roomba — needs devices + credentials, ~4 hrs
+26. Browser automation (Playwright) — powerful but brittle, ~8 hrs
+27. Multi-device support — split-brain architecture, ~weeks
+28. Semantic memory upgrade — vector search, decay scoring, ~6 hrs
 
 ---
 

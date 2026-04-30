@@ -112,6 +112,9 @@ FRIDAY_FILE_ROOTS = [
 
 VOICE_EMBEDDING_PATH = Path(__file__).parents[1] / "voice_embedding.npy"
 SPEAKER_SIM_THRESHOLD = 0.65
+# If the in-session speaker gate rejects too many consecutive transcripts,
+# fail open for that activation so the assistant does not appear "deaf".
+SESSION_SPEAKER_GATE_MAX_REJECTS = 3
 
 # ---------------------------------------------------------------------------
 # System Prompt
@@ -146,6 +149,7 @@ TOOLS
 - If you're unsure whether a tool exists for a given request, attempt the call once — or admit you don't have that capability. NEVER describe a tool, action, or capability you have not been given. Do not promise to "play the song", "set the reminder", "open the app" unless a matching tool is in your current tool list.
 - Use search for current events, politics, wars, conflicts, or other current factual questions whenever a search tool is available. Never guess.
 - Use the available app, system, messaging, memory, research, file, media, calendar, email, or delegation tools when they clearly fit the request.
+- For math, unit conversion, physics, percentages, or other non-trivial numeric work, use the `calculate` tool for precision unless the user explicitly asks for a rough estimate.
 - Follow confirmation requirements exposed by the tool descriptions for destructive actions.
 - Do not use tools for casual conversation or stable general knowledge questions unless current information or a real action is required.
 - Summarize information in your own words. Never read out URLs, source names, or raw formatting.

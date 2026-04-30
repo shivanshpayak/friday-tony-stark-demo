@@ -58,7 +58,7 @@ from livekit.plugins import silero
 from friday.config import (
     SYSTEM_PROMPT, DISMISSAL_PHRASES, SLEEP_RESPONSES,
     STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER,
-    MAX_HISTORY_ITEMS, logger,
+    MAX_HISTORY_ITEMS, SESSION_SPEAKER_GATE_MAX_REJECTS, logger,
 )
 from friday.providers import build_stt, build_llm, build_tts
 from friday.routing import LocalDomainToolPool
@@ -136,13 +136,15 @@ class FridayAgent(Agent):
                 min_silence_duration=0.5,
             ),
         )
+        self._gate_reject_streak = 0
+        self._gate_fail_open = False
 
     # -- Speaker-gated STT ------------------------------------------------
 
     async def stt_node(self, audio, model_settings):
         """Only yield transcripts from the enrolled voice."""
         gate = get_speaker_gate()
-        if not gate.enabled:
+        if not gate.enabled or self._gate_fail_open:
             async for ev in Agent.default.stt_node(self, audio, model_settings):
                 yield ev
             return
@@ -177,11 +179,23 @@ class FridayAgent(Agent):
                 is_user = True
 
             if is_user:
+                self._gate_reject_streak = 0
                 yield ev
             else:
+                self._gate_reject_streak += 1
                 text = ev.alternatives[0].text if ev.alternatives else ""
                 logger.info("Suppressed non-user transcript: %r (type=%s)",
                             text[:60], ev.type.name)
+                if self._gate_reject_streak >= SESSION_SPEAKER_GATE_MAX_REJECTS:
+                    # Safety fallback: if the voice gate keeps rejecting in-session
+                    # speech, fail open so the assistant remains usable.
+                    self._gate_fail_open = True
+                    logger.warning(
+                        "Speaker gate rejected %d consecutive transcripts; "
+                        "failing open for this activation.",
+                        self._gate_reject_streak,
+                    )
+                    yield ev
             audio_buf.clear()
 
     # -- LLM with history trimming + optional scrubber --------------------
@@ -306,28 +320,41 @@ async def _fire_greeting(session) -> None:
 
 
 def _refresh_stt_streams(stt_inst) -> None:
-    """Force Sarvam's live STT streams to reconnect before each activation."""
-    if STT_PROVIDER != "sarvam":
-        return
+    """Force live STT streams to reconnect.
 
+    Sarvam: re-applies update_options (its reconnect signal).
+    Groq / OpenAI: sets each stream's _reconnect_event to tear down and reopen
+    the WebSocket — used by the stall watchdog to recover a wedged pipeline."""
     streams = list(getattr(stt_inst, "_streams", ()))
     if not streams:
-        logger.info("No active Sarvam STT streams found to refresh")
         return
 
     refreshed = 0
-    for stream in streams:
-        update_options = getattr(stream, "update_options", None)
-        if not callable(update_options):
-            continue
-        try:
-            update_options(language="en-IN", model="saaras:v3", mode="transcribe")
-            refreshed += 1
-        except Exception as e:
-            logger.warning("Could not refresh Sarvam STT stream: %s", e)
+    if STT_PROVIDER == "sarvam":
+        for stream in streams:
+            update_options = getattr(stream, "update_options", None)
+            if not callable(update_options):
+                continue
+            try:
+                update_options(language="en-IN", model="saaras:v3", mode="transcribe")
+                refreshed += 1
+            except Exception as e:
+                logger.warning("Could not refresh Sarvam STT stream: %s", e)
+    else:
+        # Groq/OpenAI WebSocket-based streams: setting _reconnect_event causes
+        # the stream's _run loop to drop the current WS and reopen.
+        for stream in streams:
+            evt = getattr(stream, "_reconnect_event", None)
+            if evt is None:
+                continue
+            try:
+                evt.set()
+                refreshed += 1
+            except Exception as e:
+                logger.warning("Could not signal STT stream reconnect: %s", e)
 
     if refreshed:
-        logger.info("Refreshed %d Sarvam STT stream(s) for activation", refreshed)
+        logger.info("Refreshed %d %s STT stream(s)", refreshed, STT_PROVIDER)
 
 
 async def entrypoint(ctx: JobContext) -> None:
@@ -474,9 +501,21 @@ async def entrypoint(ctx: JobContext) -> None:
 
     _signing_off = False   # guard against interim+final double-fire
 
+    # ---- STT stall watchdog -------------------------------------------------
+    # Detects the failure mode where mic is enabled and VAD detects speech, but
+    # no transcripts ever arrive (seen after long idle: STT WebSocket goes
+    # stale, fails silently, no exception is raised). Recovery is to signal
+    # the STT streams to reconnect.
+    _mic_enabled = False
+    _last_speech_started = 0.0  # monotonic ts of last VAD speech-start
+    _last_transcript_at = 0.0   # monotonic ts of last user_input_transcribed
+    STT_STALL_TIMEOUT = 10.0
+    STT_WATCHDOG_INTERVAL = 5.0
+
     @session.on("user_input_transcribed")
     def _on_user_transcript(ev):
-        nonlocal _signing_off
+        nonlocal _signing_off, _last_transcript_at
+        _last_transcript_at = asyncio.get_event_loop().time()
         text = (ev.transcript or "").lower().strip()
         if dismissed.is_set() or _signing_off:
             return
@@ -496,15 +535,59 @@ async def entrypoint(ctx: JobContext) -> None:
 
             asyncio.create_task(_sign_off())
 
+    @session.on("user_state_changed")
+    def _on_user_state_changed(ev):
+        nonlocal _last_speech_started
+        if ev.new_state == "speaking" and _mic_enabled:
+            _last_speech_started = asyncio.get_event_loop().time()
+
+    async def _stt_watchdog():
+        nonlocal _last_speech_started
+        while True:
+            try:
+                await asyncio.sleep(STT_WATCHDOG_INTERVAL)
+                if not _mic_enabled:
+                    continue
+                # Only stall if VAD detected speech that produced no transcript.
+                # 0.5s tolerance: transcripts always lag the speech-start event.
+                if _last_speech_started <= _last_transcript_at + 0.5:
+                    continue
+                elapsed = asyncio.get_event_loop().time() - _last_speech_started
+                if elapsed < STT_STALL_TIMEOUT:
+                    continue
+                logger.warning(
+                    "STT watchdog: VAD detected speech %.1fs ago but no "
+                    "transcript — pipeline appears stalled. Triggering recovery.",
+                    elapsed,
+                )
+                try:
+                    session.input.set_audio_enabled(False)
+                    await asyncio.sleep(0.5)
+                    _refresh_stt_streams(stt_inst)
+                    session.input.set_audio_enabled(True)
+                    # Reset so we don't re-fire immediately on the same event.
+                    _last_speech_started = 0.0
+                    logger.info("STT watchdog: recovery attempt completed")
+                except Exception as e:
+                    logger.error("STT watchdog: recovery failed: %s", e)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error("STT watchdog loop error: %s", e)
+
+    asyncio.create_task(_stt_watchdog())
+
     # Pre-start the session so VAD + room connection is warm before the
     # first "hey friday". Silence the mic immediately — we don't want
     # transcripts landing in the LLM before the user actually wakes it.
+    voice_agent = FridayAgent(stt=stt_inst, llm=llm_inst, tts=tts_inst)
     await session.start(
-        agent=FridayAgent(stt=stt_inst, llm=llm_inst, tts=tts_inst),
+        agent=voice_agent,
         room=ctx.room,
     )
     try:
         session.input.set_audio_enabled(False)
+        _mic_enabled = False
     except Exception as e:
         logger.warning("Failed to pre-disable audio input: %s", e)
     logger.info("Session pre-warmed, audio gated off — awaiting first START")
@@ -525,6 +608,8 @@ async def entrypoint(ctx: JobContext) -> None:
         # Re-activate: clear dismissal, refresh STT, then generate the ready line
         _signing_off = False
         dismissed.clear()
+        voice_agent._gate_reject_streak = 0
+        voice_agent._gate_fail_open = False
         print("SESSION_STARTED", flush=True)
 
         try:
@@ -544,6 +629,10 @@ async def entrypoint(ctx: JobContext) -> None:
         # Enable mic after the ready line so the agent doesn't hear itself.
         try:
             session.input.set_audio_enabled(True)
+            _mic_enabled = True
+            now = asyncio.get_event_loop().time()
+            _last_speech_started = 0.0
+            _last_transcript_at = now  # reset stall window on each activation
             logger.info("Audio input enabled — listening for user speech")
             print("SESSION_LISTENING", flush=True)
         except Exception as e:
@@ -554,6 +643,7 @@ async def entrypoint(ctx: JobContext) -> None:
         logger.info("Session dismissed — gating mic")
         try:
             session.input.set_audio_enabled(False)
+            _mic_enabled = False
         except Exception:
             pass
         print("SESSION_DONE", flush=True)

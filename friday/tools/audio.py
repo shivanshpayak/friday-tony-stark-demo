@@ -5,7 +5,17 @@ import base64
 import httpx
 import pyaudio
 import asyncio
+import winsound
 from mcp.server.fastmcp import FastMCP
+
+
+def _ping_recording_started() -> None:
+    """Short async system beep so the user knows recording started.
+    Non-blocking; failures are swallowed because the ping is non-essential."""
+    try:
+        winsound.MessageBeep(winsound.MB_ICONASTERISK)
+    except Exception:
+        pass
 
 def _record_and_analyze(duration_sec: int) -> str:
     """Synchronous function to record audio and call Gemini REST."""
@@ -80,5 +90,10 @@ def register(mcp: FastMCP):
         Record real-time audio from the microphone and use Gemini Multimodal AI to identify what song the user is humming, singing, or playing in the background.
         Use this when the user says "what song am I humming" or "shazam this".
         """
+        # Audible cue that recording is starting — the LiveKit "thinking" light
+        # alone gave no feedback that the tool had actually fired. Sleep briefly
+        # so the beep finishes before the mic opens and bleeds into the take.
+        _ping_recording_started()
+        await asyncio.sleep(0.35)
         result = await asyncio.get_event_loop().run_in_executor(None, _record_and_analyze, duration)
         return f"Audio Analysis Result: {result}"

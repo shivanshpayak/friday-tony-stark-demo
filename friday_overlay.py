@@ -58,27 +58,33 @@ RIPPLE_TOTAL_BANDS = 20
 RIPPLE_BAND_WIDTH = 20
 RIPPLE_EDGE_COLOR = "#3a8adf"
 
-# Top bar — smooth glowing aura
-BAR_HEIGHT = 60                 # tall enough for a smooth vertical fade
+# Border aura — wraps all 4 edges of the screen
+BAR_THICKNESS = 40              # px depth of the glow on each edge
 BAR_COLOR = "#1a5aff"           # deepest blue
+BAR_BOTTOM_GAP = 2              # leave the taskbar autohide reveal zone clear
+# Tail feathering: below this normalized intensity, snap to the transparent
+# color key so the glow fades out cleanly instead of ending on a dark seam.
+BAR_INNER_CUTOFF = 0.08
 
 # Per-state rhythm & intensity — each state has its own fingerprint.
+# Bar alpha values are dialed back ~30% from the old top-bar-only design
+# to compensate for the larger surface area of a full-screen border.
 #   tint_steady: steady tint alpha (None means breathing)
 #   tint_hz / tint_lo / tint_hi: tint breathing params (if not steady)
 #   bar_hz / bar_lo / bar_hi: bar alpha breathing
 STATE_PROFILES = {
     # Cold boot — slow, deep, heavy; feels like a system warming up
     "booting":   dict(tint_hz=0.5, tint_lo=0.08, tint_hi=0.13,
-                      bar_hz=0.5,  bar_lo=0.10, bar_hi=0.35),
+                      bar_hz=0.5,  bar_lo=0.07, bar_hi=0.25),
     # Waiting for you — gentle, patient
     "listening": dict(tint_steady=0.10,
-                      bar_hz=1.0,  bar_lo=0.08, bar_hi=0.22),
+                      bar_hz=1.0,  bar_lo=0.06, bar_hi=0.16),
     # Actively processing — fast, bright, urgent
     "thinking":  dict(tint_hz=1.4, tint_lo=0.10, tint_hi=0.16,
-                      bar_hz=2.4,  bar_lo=0.18, bar_hi=0.48),
+                      bar_hz=2.4,  bar_lo=0.13, bar_hi=0.34),
     # Talking back — steady tint, medium rhythmic bar breath
     "speaking":  dict(tint_steady=0.10,
-                      bar_hz=1.7,  bar_lo=0.14, bar_hi=0.34),
+                      bar_hz=1.7,  bar_lo=0.10, bar_hi=0.24),
 }
 TINT_ALPHA_TARGET = STATE_PROFILES["listening"]["tint_steady"]
 
@@ -151,9 +157,9 @@ class FridayOverlay:
         self._ripple_fill = None
         self._ripple_bands = []
 
-        # Bar: one horizontal strip per pixel row (vertical gradient only)
-        self._bar_strips = []
-        self._bar_num_rows = 0
+        # Bar: one inset border ring per pixel of thickness. This keeps corners
+        # seamless and avoids edge-strip overlap/gap artifacts.
+        self._bar_rings = []
 
         # Pre-parsed bar color
         self._bar_rgb = _parse_hex(BAR_COLOR)
@@ -225,42 +231,58 @@ class FridayOverlay:
         self._tint_win.withdraw()
         self._make_click_through(self._tint_win)
 
-        # ---- Bar window (smooth aura at top) ----
+        # ---- Bar window (border aura wrapping all 4 edges) ----
+        # Full-screen layered window with transparent interior. The 4 edges
+        # are pre-rendered as gradient strips fading inward. Per-frame cost
+        # is just one alpha attribute update — same as the old top-only bar.
+        bar_h = self._screen_h - BAR_BOTTOM_GAP
         self._bar_win = tk.Toplevel(self._root)
         self._bar_win.overrideredirect(True)
         self._bar_win.attributes("-topmost", True)
-        self._bar_win.geometry(f"{self._screen_w}x{BAR_HEIGHT}+0+0")
+        self._bar_win.geometry(f"{self._screen_w}x{bar_h}+0+0")
         self._bar_win.configure(bg=bar_bg_key)
         self._bar_win.attributes("-transparentcolor", bar_bg_key)
         self._bar_win.attributes("-alpha", 0.0)
 
         self._bar_canvas = tk.Canvas(
             self._bar_win,
-            width=self._screen_w, height=BAR_HEIGHT,
+            width=self._screen_w, height=bar_h,
             bg=bar_bg_key, highlightthickness=0,
         )
         self._bar_canvas.pack()
 
-        # Build the bar: ONE full-width horizontal strip per pixel row.
-        # ~60 canvas items total (vs 28,800) — vertical gradient only, no
-        # horizontal animation. All "thinking" feedback comes from animating
-        # the window alpha faster/brighter, which is essentially free.
-        self._bar_num_rows = BAR_HEIGHT
+        # Build a continuous border gradient using concentric 1px rectangle
+        # outlines. This removes corner seams caused by composing separate
+        # top/bottom/side strips with slightly different geometry.
         bg_rgb = _parse_hex(bar_bg_key)
-        self._bar_strips = []
-        for row in range(self._bar_num_rows):
-            t = 1.0 - (row / max(1, self._bar_num_rows - 1))
-            fade = t * t  # quadratic falloff — strong at top, soft tail
-            color = _lerp_color_rgb(
+        self._bar_rings = []
+
+        def _gradient_color(distance_from_edge: int) -> str:
+            t = 1.0 - (distance_from_edge / max(1, BAR_THICKNESS - 1))
+            fade = t * t * t  # cubic falloff for a softer interior tail
+            if fade <= BAR_INNER_CUTOFF:
+                # Exact transparent key removes the visible "inner edge" line.
+                return bar_bg_key
+            return _lerp_color_rgb(
                 bg_rgb[0], bg_rgb[1], bg_rgb[2],
                 self._bar_rgb[0], self._bar_rgb[1], self._bar_rgb[2],
                 fade,
             )
-            strip = self._bar_canvas.create_rectangle(
-                0, row, self._screen_w, row + 1,
-                fill=color, outline="",
+
+        # Each inset "ring" is a 1px outline rectangle. The outer ring is the
+        # strongest color; inner rings fade toward transparent.
+        max_inset = max(0, BAR_THICKNESS - 1)
+        for inset in range(max_inset + 1):
+            color = _gradient_color(inset)
+            ring = self._bar_canvas.create_rectangle(
+                inset,
+                inset,
+                max(inset, self._screen_w - 1 - inset),
+                max(inset, bar_h - 1 - inset),
+                outline=color,
+                width=1,
             )
-            self._bar_strips.append(strip)
+            self._bar_rings.append(ring)
 
         self._bar_win.withdraw()
         self._make_click_through(self._bar_win)
