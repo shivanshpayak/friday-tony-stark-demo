@@ -17,6 +17,13 @@ STT_PROVIDER       = "groq"
 LLM_PROVIDER       = "gemini"
 TTS_PROVIDER       = "google"
 
+# --- STT connection tolerance (defense-in-depth against transient blips) ---
+# livekit defaults are max_retry=3, timeout=10.0; a brief network blip on the
+# Groq STT path exhausts those in ~30s and kills the session. Widen them so
+# short outages are ridden out before any close happens.
+STT_MAX_RETRY = 6
+STT_TIMEOUT   = 15.0
+
 GEMINI_LLM_MODEL   = "gemini-2.5-flash"
 OPENAI_LLM_MODEL   = "gpt-4o"
 GROQ_LLM_MODEL     = "llama-3.1-8b-instant"
@@ -59,6 +66,14 @@ TASK_LONG_THRESHOLD_SECONDS = 5.0
 SCHEDULED_STORE_PATH = Path(__file__).parents[1] / "runtime" / "scheduled.json"
 SCHEDULED_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 SCHEDULER_TICK_SECONDS = 1.0
+
+# ---------------------------------------------------------------------------
+# Learned Web Automation Context
+# ---------------------------------------------------------------------------
+WEB_AUTOMATION_CONTEXT_PATH = (
+    Path(__file__).parents[1] / "runtime" / "web_automation" / "context.json"
+)
+WEB_AUTOMATION_CONTEXT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # App Launcher (Phase 1)
@@ -157,8 +172,20 @@ TOOLS
 - After completing an action, confirm in one short line. No follow-up questions unless information is missing.
 - When solving math or physics problems, if any value, unit, or assumption isn't explicit, ask the user before computing — never substitute a guessed number into the calculation.
 
+SPELLING
+When asked to spell a word, name a letter, or read out an abbreviation or acronym letter by letter, output each letter in uppercase separated by spaces and periods, e.g. "E. I. N. S. T. E. I. N." or "N. A. S. A." The trailing periods and spacing are required — without them the TTS pronounces the phoneme ("eh", "buh") instead of the letter name. Use this any time the user asks "how do you spell X", "what's the first letter of X", "spell it out", "say each letter", or similar.
+
 DISMISSAL: If he says "that'll be all", "stand down", "go to sleep", or "goodbye", respond with a brief, composed sign-off. Something that feels like a sentinel returning to his post — not a goodbye, just a quiet step back into the shadows.
 """.strip()
+
+# Spoken when the agent comes back after a fatal STT/connection drop forced a
+# restart. One short line acknowledging the drop, in FRIDAY's voice.
+RECOVERY_LINE_INSTRUCTIONS = (
+    "You just reconnected after briefly losing the connection. "
+    "Reply with exactly one short, calm, professional sentence acknowledging "
+    "the drop and that you are back. Example: 'I lost the connection for a moment, sir — back now.' "
+    "Never use his name. Do NOT mention errors, networks, restarts, or tools. Do NOT call any tools."
+)
 
 # ---------------------------------------------------------------------------
 # Dismissal

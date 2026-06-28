@@ -52,17 +52,20 @@ from livekit.agents import (
     llm as lk_llm, stt, TurnHandlingOptions,
 )
 from livekit.agents.voice import Agent, AgentSession
+from livekit.agents.voice.events import CloseReason  # noqa: F401  (documents the reason values)
 from livekit.agents.voice.turn import InterruptionOptions, EndpointingOptions
-from livekit.plugins import silero
+from friday.webrtc_vad import WebRTCVAD
 
 from friday.config import (
     SYSTEM_PROMPT, DISMISSAL_PHRASES, SLEEP_RESPONSES,
     STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER,
     MAX_HISTORY_ITEMS, SESSION_SPEAKER_GATE_MAX_REJECTS, logger,
+    RECOVERY_LINE_INSTRUCTIONS,
 )
-from friday.providers import build_stt, build_llm, build_tts
+from friday.providers import build_stt, build_llm, build_tts, build_session_conn_options
 from friday.routing import LocalDomainToolPool
 from friday.speaker_gate import get_speaker_gate
+from friday.recovery import is_fatal_close
 
 # Repo root — used to locate server.py when spawning the MCP subprocess.
 _REPO_ROOT = Path(__file__).resolve().parent
@@ -125,15 +128,18 @@ class FridayAgent(Agent):
         from friday.tools.memory import get_memories_prompt
         memories = get_memories_prompt()
         full_prompt = SYSTEM_PROMPT + ("\n\n" + memories if memories else "")
+        # WebRTC VAD: ~100× faster than Silero ONNX on this CPU. Silero kept
+        # running "slower than realtime" even at 8 kHz, backing up audio
+        # minutes deep until the agent looked frozen. WebRTC is noisier
+        # (triggers on keystrokes), but the enrolled speaker gate filters
+        # any spurious transcripts downstream.
         super().__init__(
             instructions=full_prompt,
             stt=stt, llm=llm, tts=tts,
-            vad=vad or silero.VAD.load(
-                # Bumped from 0.92 / 0.5 to filter out background chatter,
-                # typing, distant voices, brief noises during a session.
-                activation_threshold=0.6,
-                min_speech_duration=0.1,
-                min_silence_duration=0.5,
+            vad=vad or WebRTCVAD(
+                aggressiveness=2,
+                min_speech_frames=5,   # 100 ms minimum speech
+                min_silence_frames=25, # 500 ms silence to end turn
             ),
         )
         self._gate_reject_streak = 0
@@ -144,8 +150,46 @@ class FridayAgent(Agent):
     async def stt_node(self, audio, model_settings):
         """Only yield transcripts from the enrolled voice."""
         gate = get_speaker_gate()
+
+        # Audio-flow probe: logs every 5s (≈500 frames at 100fps) so we can
+        # see at a glance whether frames keep arriving from the mic. Also fires
+        # an alarm if no frame has arrived in 3s — that's the signature of the
+        # post-activation freeze.
+        async def _probed(src):
+            count = 0
+            last_log_at = 0.0
+            last_frame_at = 0.0
+            loop = asyncio.get_event_loop()
+            async def _no_frame_alarm():
+                nonlocal last_frame_at
+                while True:
+                    await asyncio.sleep(1.0)
+                    if last_frame_at > 0 and loop.time() - last_frame_at > 3.0:
+                        logger.warning(
+                            "stt_node: NO audio frames for %.1fs — mic feed wedged",
+                            loop.time() - last_frame_at,
+                        )
+                        # only warn once per outage
+                        last_frame_at = 0.0
+            alarm_task = asyncio.create_task(_no_frame_alarm())
+            try:
+                async for f in src:
+                    now = loop.time()
+                    if last_frame_at == 0.0:
+                        logger.info("stt_node: audio frames flowing (sr=%d)",
+                                    f.sample_rate)
+                    last_frame_at = now
+                    count += 1
+                    if now - last_log_at >= 5.0:
+                        logger.info("stt_node: %d frames in last interval", count)
+                        last_log_at = now
+                        count = 0
+                    yield f
+            finally:
+                alarm_task.cancel()
+
         if not gate.enabled or self._gate_fail_open:
-            async for ev in Agent.default.stt_node(self, audio, model_settings):
+            async for ev in Agent.default.stt_node(self, _probed(audio), model_settings):
                 yield ev
             return
 
@@ -154,7 +198,7 @@ class FridayAgent(Agent):
 
         async def _buffered_audio():
             nonlocal sample_rate
-            async for frame in audio:
+            async for frame in _probed(audio):
                 audio_buf.append(frame)
                 sample_rate = frame.sample_rate
                 yield frame
@@ -174,7 +218,11 @@ class FridayAgent(Agent):
                 pcm = np.concatenate(
                     [np.frombuffer(f.data, dtype=np.int16) for f in audio_buf]
                 )
-                is_user = gate.verify(pcm, sample_rate)
+                # gate.verify runs Resemblyzer's neural embedding extraction
+                # which can take hundreds of ms. Pushing it to a thread keeps
+                # the asyncio event loop free to log frames, fire watchdogs,
+                # and process the next batch of audio.
+                is_user = await asyncio.to_thread(gate.verify, pcm, sample_rate)
             else:
                 is_user = True
 
@@ -295,7 +343,7 @@ async def _stdin_dispatch_loop(session, cmd_queue: asyncio.Queue) -> None:
                 logger.info("INTERRUPT received — session.interrupt(force=True) called")
             except Exception as e:
                 logger.warning("session.interrupt() failed: %s", e)
-        elif cmd in ("START", "QUIT"):
+        elif cmd in ("START", "START_RECOVERED", "QUIT"):
             await cmd_queue.put(cmd)
 
 
@@ -399,6 +447,12 @@ async def entrypoint(ctx: JobContext) -> None:
     asyncio.create_task(core_toolset.setup())
 
     session = AgentSession(
+        # No AEC warmup grace period — its purpose is to suppress interruptions
+        # while AEC learns the speaker profile, but our voice gate already
+        # filters self-transcripts and warmup just made input invisible for
+        # ~3s after every activation.
+        aec_warmup_duration=0.0,
+        conn_options=build_session_conn_options(),
         turn_handling=TurnHandlingOptions(
             turn_detection="vad",
             endpointing=EndpointingOptions(
@@ -407,7 +461,13 @@ async def entrypoint(ctx: JobContext) -> None:
             ),
             # Verbal interruption disabled — only the launcher's PTT keybind
             # interrupts an in-flight turn (via INTERRUPT stdin command below).
-            interruption=InterruptionOptions(enabled=False),
+            # discard_audio_if_uninterruptible=False keeps input flowing while
+            # the agent is uninterruptible-speaking, otherwise the ready-line
+            # would eat the first ~2s of the user's reply.
+            interruption=InterruptionOptions(
+                enabled=False,
+                discard_audio_if_uninterruptible=False,
+            ),
         ),
         tools=[core_toolset],
         max_tool_steps=3,
@@ -499,6 +559,12 @@ async def entrypoint(ctx: JobContext) -> None:
     dismissed = asyncio.Event()
     dismissed.set()
 
+    # Fatal-close recovery state. `_fatal[0]` is raised by the close handler when
+    # an unrecoverable STT/connection error closes the session; `_intentional[0]`
+    # is raised before our OWN aclose()/QUIT so the handler ignores those.
+    _fatal = [False]
+    _intentional = [False]
+
     _signing_off = False   # guard against interim+final double-fire
 
     # ---- STT stall watchdog -------------------------------------------------
@@ -507,10 +573,19 @@ async def entrypoint(ctx: JobContext) -> None:
     # stale, fails silently, no exception is raised). Recovery is to signal
     # the STT streams to reconnect.
     _mic_enabled = False
+    _mic_enabled_at = 0.0       # monotonic ts when mic was last enabled
     _last_speech_started = 0.0  # monotonic ts of last VAD speech-start
     _last_transcript_at = 0.0   # monotonic ts of last user_input_transcribed
-    STT_STALL_TIMEOUT = 10.0
-    STT_WATCHDOG_INTERVAL = 5.0
+    STT_STALL_TIMEOUT = 8.0
+    STT_WATCHDOG_INTERVAL = 2.0
+    # Cooldown: don't fire watchdog recovery more than once per 15s.
+    # Otherwise back-to-back firings tear down connections that just need
+    # more time, creating a perpetual reconnect loop with no transcripts.
+    STT_RECOVERY_COOLDOWN = 15.0
+    _last_recovery_at = 0.0
+    # If mic is enabled this long with zero VAD/transcript activity, the
+    # audio pipeline itself is wedged (not just STT).
+    DEAD_PIPELINE_TIMEOUT = 15.0
 
     @session.on("user_input_transcribed")
     def _on_user_transcript(ev):
@@ -542,31 +617,53 @@ async def entrypoint(ctx: JobContext) -> None:
             _last_speech_started = asyncio.get_event_loop().time()
 
     async def _stt_watchdog():
-        nonlocal _last_speech_started
+        nonlocal _last_speech_started, _mic_enabled_at, _last_recovery_at
         while True:
             try:
                 await asyncio.sleep(STT_WATCHDOG_INTERVAL)
                 if not _mic_enabled:
                     continue
-                # Only stall if VAD detected speech that produced no transcript.
+                now = asyncio.get_event_loop().time()
+                # Cooldown: prevent reconnect-storm where back-to-back
+                # firings tear down WebSockets faster than Whisper can
+                # produce a transcript on them.
+                if now - _last_recovery_at < STT_RECOVERY_COOLDOWN:
+                    continue
+                stall_reason: str | None = None
+                # Case 1: VAD detected speech but no transcript followed.
                 # 0.5s tolerance: transcripts always lag the speech-start event.
-                if _last_speech_started <= _last_transcript_at + 0.5:
+                if _last_speech_started > _last_transcript_at + 0.5:
+                    elapsed = now - _last_speech_started
+                    if elapsed >= STT_STALL_TIMEOUT:
+                        stall_reason = (
+                            f"VAD detected speech {elapsed:.1f}s ago but no "
+                            f"transcript — STT WebSocket likely stale."
+                        )
+                # Case 2: mic enabled for a long time with ZERO activity
+                # (no VAD speech-start events at all, no transcripts since
+                # enable). Audio pipeline itself is wedged — VAD wasn't even
+                # told there was sound to look at.
+                if stall_reason is None and _mic_enabled_at > 0:
+                    enabled_for = now - _mic_enabled_at
+                    last_event = max(_last_speech_started, _last_transcript_at)
+                    if (enabled_for >= DEAD_PIPELINE_TIMEOUT
+                            and last_event <= _mic_enabled_at):
+                        stall_reason = (
+                            f"mic enabled {enabled_for:.1f}s with zero VAD "
+                            f"or transcript events — audio pipeline wedged."
+                        )
+                if stall_reason is None:
                     continue
-                elapsed = asyncio.get_event_loop().time() - _last_speech_started
-                if elapsed < STT_STALL_TIMEOUT:
-                    continue
-                logger.warning(
-                    "STT watchdog: VAD detected speech %.1fs ago but no "
-                    "transcript — pipeline appears stalled. Triggering recovery.",
-                    elapsed,
-                )
+                logger.warning("STT watchdog: %s Triggering recovery.", stall_reason)
                 try:
                     session.input.set_audio_enabled(False)
                     await asyncio.sleep(0.5)
                     _refresh_stt_streams(stt_inst)
                     session.input.set_audio_enabled(True)
-                    # Reset so we don't re-fire immediately on the same event.
+                    # Reset stall windows so we don't re-fire immediately.
                     _last_speech_started = 0.0
+                    _mic_enabled_at = asyncio.get_event_loop().time()
+                    _last_recovery_at = asyncio.get_event_loop().time()
                     logger.info("STT watchdog: recovery attempt completed")
                 except Exception as e:
                     logger.error("STT watchdog: recovery failed: %s", e)
@@ -597,13 +694,31 @@ async def entrypoint(ctx: JobContext) -> None:
     cmd_queue: asyncio.Queue = asyncio.Queue()
     asyncio.create_task(_stdin_dispatch_loop(session, cmd_queue))
 
+    @session.on("close")
+    def _on_session_close(ev):
+        # Sync emit callback, runs on the session loop. On a fatal close, signal
+        # the launcher and unblock the activation loop so the process exits
+        # through its normal cleanup; the launcher then respawns us.
+        if not is_fatal_close(ev.reason, intentional=_intentional[0]):
+            return
+        logger.error("Session closed fatally (reason=%s, error=%s) — exiting for respawn",
+                     getattr(ev.reason, "value", ev.reason), ev.error)
+        _fatal[0] = True
+        print("SESSION_FATAL", flush=True)
+        dismissed.set()                      # unblock the ACTIVE `await dismissed.wait()`
+        try:
+            cmd_queue.put_nowait("FATAL")    # unblock the idle `await cmd_queue.get()`
+        except Exception:
+            pass
+
     # ---- Activation loop (first START + every subsequent one use the same path) ----
     while True:
         logger.info("Waiting for START command on stdin…")
         cmd = await cmd_queue.get()
-        if cmd != "START":
+        if cmd not in ("START", "START_RECOVERED"):
             logger.info("Received %r — shutting down", cmd or "EOF")
             break
+        recovered = cmd == "START_RECOVERED"
 
         # Re-activate: clear dismissal, refresh STT, then generate the ready line
         _signing_off = False
@@ -619,18 +734,22 @@ async def entrypoint(ctx: JobContext) -> None:
 
         try:
             await session.generate_reply(
-                instructions=_READY_LINE_INSTRUCTIONS,
+                instructions=(
+                    RECOVERY_LINE_INSTRUCTIONS if recovered else _READY_LINE_INSTRUCTIONS
+                ),
                 tool_choice="none",
             )
-            logger.info("Re-activation ready line completed")
+            logger.info("%s ready line completed",
+                        "Recovery" if recovered else "Re-activation")
         except Exception as e:
-            logger.warning("Re-activation ready line failed: %s", e)
+            logger.warning("Ready line failed: %s", e)
 
         # Enable mic after the ready line so the agent doesn't hear itself.
         try:
             session.input.set_audio_enabled(True)
             _mic_enabled = True
             now = asyncio.get_event_loop().time()
+            _mic_enabled_at = now
             _last_speech_started = 0.0
             _last_transcript_at = now  # reset stall window on each activation
             logger.info("Audio input enabled — listening for user speech")
@@ -638,8 +757,12 @@ async def entrypoint(ctx: JobContext) -> None:
         except Exception as e:
             logger.warning("Failed to enable audio input: %s", e)
 
-        # Stay active until user dismisses ("that'll be all", etc.)
+
+        # Stay active until user dismisses ("that'll be all", etc.) or a fatal close.
         await dismissed.wait()
+        if _fatal[0]:
+            logger.info("Fatal close — breaking activation loop for clean exit")
+            break
         logger.info("Session dismissed — gating mic")
         try:
             session.input.set_audio_enabled(False)
@@ -649,6 +772,7 @@ async def entrypoint(ctx: JobContext) -> None:
         print("SESSION_DONE", flush=True)
 
     # Clean up
+    _intentional[0] = True
     try:
         await session.aclose()
     except Exception:
@@ -657,7 +781,7 @@ async def entrypoint(ctx: JobContext) -> None:
         await tool_pool.aclose()
     except Exception:
         pass
-    ctx.shutdown("stdin closed")
+    ctx.shutdown("stdin closed" if not _fatal[0] else "fatal session close")
 
 
 # ---------------------------------------------------------------------------

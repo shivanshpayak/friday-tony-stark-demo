@@ -24,6 +24,9 @@ from livekit.plugins import (
     openai as lk_openai,
     sarvam,
 )
+from livekit.agents import APIConnectOptions
+from livekit.agents.voice.agent_session import SessionConnectOptions
+from .config import STT_MAX_RETRY, STT_TIMEOUT
 
 
 def build_stt(http_session=None, room_name=None):
@@ -140,3 +143,17 @@ def build_tts(http_session=None):
         )
     else:
         raise ValueError(f"Unknown TTS_PROVIDER: {TTS_PROVIDER!r}")
+
+
+def build_session_conn_options() -> SessionConnectOptions:
+    """Connection options for the AgentSession.
+
+    Widens STT retry/timeout beyond livekit defaults (max_retry=3, timeout=10)
+    so a brief blip on the STT path is ridden out instead of closing the session.
+    """
+    return SessionConnectOptions(
+        stt_conn_options=APIConnectOptions(
+            max_retry=STT_MAX_RETRY,
+            timeout=STT_TIMEOUT,
+        ),
+    )

@@ -31,6 +31,7 @@ import pyaudio
 from dotenv import load_dotenv
 from openwakeword.model import Model as WakeWordModel
 from friday_overlay import FridayOverlay
+from friday.recovery import should_announce_recovery
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +447,8 @@ class AgentProcess:
                                        PROCESSING | SPEAKING
     """
 
-    def __init__(self, on_processing=None, on_speaking=None, on_listening=None):
+    def __init__(self, on_processing=None, on_speaking=None, on_listening=None,
+                 on_fatal=None):
         self._proc: subprocess.Popen | None = None
         self._ready = threading.Event()
         self._session_done = threading.Event()
@@ -454,6 +456,7 @@ class AgentProcess:
         self._on_processing = on_processing  # callback when LLM starts thinking
         self._on_speaking = on_speaking       # callback when first TTS content arrives
         self._on_listening = on_listening     # callback when mic is live again
+        self._on_fatal = on_fatal             # callback on SESSION_FATAL (session died)
 
     @property
     def alive(self) -> bool:
@@ -527,36 +530,42 @@ class AgentProcess:
         try:
             assert self._proc and self._proc.stdout
             for line in self._proc.stdout:
-                stripped = line.rstrip()
-                if "FRIDAY_READY" in stripped:
-                    logger.info("Agent subprocess signalled FRIDAY_READY")
-                    self._ready.set()
-                elif "SESSION_STARTED" in stripped:
-                    logger.info("Agent subprocess signalled SESSION_STARTED")
-                elif "SESSION_LISTENING" in stripped:
-                    logger.info("Agent subprocess signalled SESSION_LISTENING")
-                    if self._on_listening:
-                        self._on_listening()
-                elif "SESSION_DONE" in stripped:
-                    logger.info("Agent subprocess signalled SESSION_DONE")
-                    self._session_done.set()
-                elif "PROCESSING" in stripped:
-                    if self._on_processing:
-                        self._on_processing()
-                elif "SPEAKING" in stripped:
-                    if self._on_speaking:
-                        self._on_speaking()
-                elif stripped:
-                    # Skip noisy LiveKit SDK internal debug lines.
-                    if any(p in stripped for p in self._NOISE_PATTERNS):
-                        continue
-                    # Log via the agent-tagged logger (goes to file + console).
-                    logging.getLogger("friday-agent").info(stripped)
+                self._dispatch_line(line.rstrip())
         except Exception as e:
             logger.debug("stdout reader error: %s", e)
         finally:
             self._ready.set()
             self._session_done.set()
+
+    def _dispatch_line(self, stripped: str):
+        if "FRIDAY_READY" in stripped:
+            logger.info("Agent subprocess signalled FRIDAY_READY")
+            self._ready.set()
+        elif "SESSION_FATAL" in stripped:
+            logger.error("Agent subprocess signalled SESSION_FATAL — session died, will respawn")
+            if self._on_fatal:
+                self._on_fatal()
+        elif "SESSION_STARTED" in stripped:
+            logger.info("Agent subprocess signalled SESSION_STARTED")
+        elif "SESSION_LISTENING" in stripped:
+            logger.info("Agent subprocess signalled SESSION_LISTENING")
+            if self._on_listening:
+                self._on_listening()
+        elif "SESSION_DONE" in stripped:
+            logger.info("Agent subprocess signalled SESSION_DONE")
+            self._session_done.set()
+        elif "PROCESSING" in stripped:
+            if self._on_processing:
+                self._on_processing()
+        elif "SPEAKING" in stripped:
+            if self._on_speaking:
+                self._on_speaking()
+        elif stripped:
+            # Skip noisy LiveKit SDK internal debug lines.
+            if any(p in stripped for p in self._NOISE_PATTERNS):
+                return
+            # Log via the agent-tagged logger (goes to file + console).
+            logging.getLogger("friday-agent").info(stripped)
 
     async def wait_ready(self, timeout: float = 60.0) -> bool:
         """Block until FRIDAY_READY (or timeout/death)."""
@@ -576,6 +585,19 @@ class AgentProcess:
             self._proc.stdin.flush()
         except Exception as e:
             logger.error("Failed to write START: %s", e)
+
+    def send_start_recovered(self):
+        """Begin a session that opens with the recovery line (post-crash respawn)."""
+        if not self.alive:
+            logger.warning("Cannot send START_RECOVERED — agent subprocess is dead")
+            return
+        self._session_done.clear()
+        assert self._proc and self._proc.stdin
+        try:
+            self._proc.stdin.write("START_RECOVERED\n")
+            self._proc.stdin.flush()
+        except Exception as e:
+            logger.error("Failed to write START_RECOVERED: %s", e)
 
     async def wait_session_done(self):
         """Block until SESSION_DONE (or subprocess death)."""
@@ -637,10 +659,20 @@ async def launcher_loop():
     wakeword = WakeWordListener()
     overlay = FridayOverlay()
     verifier = SpeakerVerifier()
+    pending_recovery_cue = threading.Event()
+    # Set only while a session is live (mic active / user conversing). A fatal
+    # close while this is clear (idle, awaiting wake word) recovers silently.
+    session_active = threading.Event()
+
+    def _on_fatal():
+        if should_announce_recovery(session_active=session_active.is_set()):
+            pending_recovery_cue.set()
+
     agent = AgentProcess(
         on_processing=lambda: overlay.show_loading("Thinking..."),
         on_speaking=lambda: overlay.hide_loading(),
         on_listening=lambda: overlay.show(),
+        on_fatal=_on_fatal,
     )
 
     overlay.start()
@@ -742,6 +774,7 @@ async def launcher_loop():
 
     wakeword.start_stream()
     state = State.SLEEPING
+    recovery_started = False  # set when START_RECOVERED was already sent post-respawn
     logger.info("JARVIS launcher ready — say 'Hey Jarvis' to activate")
 
     try:
@@ -756,6 +789,19 @@ async def launcher_loop():
                     await agent.wait_ready(timeout=60.0)
                     overlay.hide()
                     wakeword.start_stream()
+                    # If the death was a fatal session close (SESSION_FATAL),
+                    # come back speaking — re-activate with the recovery line
+                    # instead of waiting silently for the next wake word.
+                    if pending_recovery_cue.is_set() and agent.alive:
+                        pending_recovery_cue.clear()
+                        logger.info("Recovering from fatal close — re-activating with recovery line")
+                        play_activation_ack()
+                        overlay.show_loading("Reconnecting...")
+                        agent.send_start_recovered()
+                        recovery_started = True
+                        state = State.ACTIVE
+                        logger.info("State → ACTIVE (recovery)")
+                        continue
 
                 # Push-to-talk has priority — explicit user action skips
                 # both wake-word match and speaker verification.
@@ -796,15 +842,20 @@ async def launcher_loop():
 
             elif state == State.ACTIVE:
                 wakeword.stop_stream()
+                session_active.set()   # mid-conversation: a fatal drop now re-announces
 
                 # Tell the already-running subprocess to start a session.
                 # The overlay shows "Waking up..." from the wake word handler;
                 # it'll switch to bars when the agent sends SPEAKING, or
                 # show "Thinking..." on PROCESSING signals.
-                agent.send_start()
+                if recovery_started:
+                    recovery_started = False   # START_RECOVERED already sent
+                else:
+                    agent.send_start()
 
                 # Wait for the session to end (dismissal or crash).
                 await agent.wait_session_done()
+                session_active.clear()  # back to idle; further drops recover silently
 
                 overlay.hide()
                 await asyncio.sleep(1.5)
