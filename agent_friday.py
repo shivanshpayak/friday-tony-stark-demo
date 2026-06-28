@@ -437,6 +437,25 @@ async def entrypoint(ctx: JobContext) -> None:
     )
     logger.info("Providers + speaker gate warm — preparing session")
 
+    # Pre-build the Google TTS grpc client NOW, on the boot path. The livekit
+    # google plugin otherwise builds it lazily inside _ensure_client during the
+    # first synthesis — which runs on livekit's job thread while audio/STT
+    # threads are active, where grpc's aio channel deadlocks starting its poller
+    # thread (the same call is ~0.1s here, but hangs forever on the busy job
+    # thread). Building it once at boot means the first greeting finds it ready.
+    #
+    # NOTE: this MUST run directly on the entrypoint's event loop (the same loop
+    # the session uses), not via run_in_executor — grpc.aio binds the channel to
+    # the running loop, and an executor thread has no loop (the call would fail).
+    if TTS_PROVIDER == "google":
+        ensure_client = getattr(tts_inst, "_ensure_client", None)
+        if callable(ensure_client):
+            try:
+                ensure_client()
+                logger.info("Google TTS client pre-warmed")
+            except Exception as e:
+                logger.warning("Google TTS client pre-warm failed: %s", e)
+
     # Keep a small always-on core tool surface warm, and route heavier domains
     # in only when the current request needs them.
     tool_pool = LocalDomainToolPool(repo_root=_REPO_ROOT)
