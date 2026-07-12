@@ -13,9 +13,9 @@ load_dotenv()
 # Providers & Models
 # ---------------------------------------------------------------------------
 
-STT_PROVIDER       = "groq"
+STT_PROVIDER       = "deepgram"   # switched from groq (groq returned no transcripts); deepgram transcribes reliably
 LLM_PROVIDER       = "gemini"
-TTS_PROVIDER       = "google"
+TTS_PROVIDER       = "google"   # Gemini TTS, Charon voice
 
 # --- STT connection tolerance (defense-in-depth against transient blips) ---
 # livekit defaults are max_retry=3, timeout=10.0; a brief network blip on the
@@ -127,6 +127,13 @@ FRIDAY_FILE_ROOTS = [
 
 VOICE_EMBEDDING_PATH = Path(__file__).parents[1] / "voice_embedding.npy"
 SPEAKER_SIM_THRESHOLD = 0.65
+# Master switch for the in-session, per-transcript speaker verification. Turned
+# OFF: single-user setup doesn't need it, and it was rejecting the owner's own
+# voice (enrolled profile vs. current acoustics), forcing PTT-spam. With it off
+# every transcript is accepted; self-echo is prevented instead by muting the mic
+# while the agent speaks (discard_audio_if_uninterruptible in agent_friday.py).
+# (The launcher's wake-word speaker check is separate and stays on.)
+SESSION_SPEAKER_GATE_ENABLED = False
 # If the in-session speaker gate rejects too many consecutive transcripts,
 # fail open for that activation so the assistant does not appear "deaf".
 SESSION_SPEAKER_GATE_MAX_REJECTS = 3

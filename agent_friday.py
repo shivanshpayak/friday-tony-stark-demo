@@ -44,6 +44,116 @@ def _apply_session_mic() -> None:
 
 _apply_session_mic()
 
+
+# ---------------------------------------------------------------------------
+# Windows ProactorEventLoop + anyio "happy eyeballs" hang.
+# anyio.connect_tcp() races multiple socket connects (IPv4/IPv6) and cancels
+# the losers. On Windows' ProactorEventLoop, cancelling an in-flight overlapped
+# TCP connect wedges the task forever in "cancelling" state (its _OverlappedFuture
+# is cancelled but never completes), so anyio's task group never exits and the
+# whole HTTP connection hangs. This intermittently froze the first Gemini LLM
+# call during the greeting (confirmed via asyncio task-stack dump). httpcore
+# calls anyio.connect_tcp WITHOUT passing happy_eyeballs_delay, so forcing a huge
+# default makes connects sequential (one attempt at a time) — no racing, no
+# cancellation, no hang. Negligible cost: connecting to Google always succeeds
+# on the first address.
+def _patch_anyio_happy_eyeballs() -> None:
+    try:
+        import functools
+        import anyio
+        _orig_connect_tcp = anyio.connect_tcp
+        if getattr(_orig_connect_tcp, "_friday_seq_patched", False):
+            return
+
+        @functools.wraps(_orig_connect_tcp)
+        async def _sequential_connect_tcp(*args, **kwargs):
+            kwargs.setdefault("happy_eyeballs_delay", 86400.0)  # effectively disable racing
+            return await _orig_connect_tcp(*args, **kwargs)
+
+        _sequential_connect_tcp._friday_seq_patched = True
+        anyio.connect_tcp = _sequential_connect_tcp
+    except Exception as e:
+        print(f"anyio happy-eyeballs patch failed: {e}", flush=True)
+
+# Toggle to A/B test whether these network patches are implicated in an issue.
+_DISABLE_NET_PATCHES = os.getenv("FRIDAY_DISABLE_NET_PATCHES") == "1"
+if not _DISABLE_NET_PATCHES:
+    _patch_anyio_happy_eyeballs()
+
+
+# ---------------------------------------------------------------------------
+# Force IPv4-only name resolution.
+# The ProactorEventLoop connect-cancellation wedge (see above) is only ever
+# triggered because connections race IPv4 vs IPv6 and cancel the loser. All of
+# FRIDAY's providers (Gemini, Google TTS, Deepgram, Groq) are reachable over
+# IPv4, and each resolves to a single IPv4 address here — so restricting name
+# resolution to IPv4 means there is nothing to race, nothing to cancel, and no
+# stall on a first-tried IPv6 address when the event loop is under load. We only
+# override the default (unspecified-family) lookups, and fall back to the normal
+# resolver if a host has no IPv4 record, so IPv6-only hosts still work.
+def _force_ipv4_resolution() -> None:
+    try:
+        import socket
+        _orig_getaddrinfo = socket.getaddrinfo
+        if getattr(_orig_getaddrinfo, "_friday_ipv4_only", False):
+            return
+
+        def _ipv4_only(host, port, family=0, *args, **kwargs):
+            if family == 0:
+                try:
+                    res = _orig_getaddrinfo(host, port, socket.AF_INET, *args, **kwargs)
+                    if res:
+                        return res
+                except socket.gaierror:
+                    pass
+                return _orig_getaddrinfo(host, port, 0, *args, **kwargs)
+            return _orig_getaddrinfo(host, port, family, *args, **kwargs)
+
+        _ipv4_only._friday_ipv4_only = True
+        socket.getaddrinfo = _ipv4_only
+    except Exception as e:
+        print(f"IPv4-only resolution patch failed: {e}", flush=True)
+
+if not _DISABLE_NET_PATCHES:
+    _force_ipv4_resolution()
+
+
+# ---------------------------------------------------------------------------
+# Console APM: force all processing OFF (passthrough).
+# livekit's console audio builds AudioProcessingModule(echo_cancellation=True,
+# noise_suppression=True, high_pass_filter=True, auto_gain_control=True) and runs
+# the mic through process_stream before the STT. Evidence strongly suggests this
+# pipeline strips the user's voice down to the noise floor here (raw mic peaks
+# ~7800, but frames reaching the STT peak ~26), so the STT receives silence and
+# returns no transcripts. Force an all-off (passthrough) APM. FRIDAY's speaker
+# gate already filters the agent's own voice, so console AEC buys us nothing.
+# Set FRIDAY_KEEP_APM=1 to restore livekit's default APM.
+def _force_console_apm_off() -> None:
+    if os.getenv("FRIDAY_KEEP_APM") == "1":
+        return
+    try:
+        from livekit import rtc
+        _orig_apm = rtc.AudioProcessingModule
+        if getattr(_orig_apm, "_friday_apm_off", False):
+            return
+
+        def _apm_off(*args, **kwargs):
+            return _orig_apm(
+                echo_cancellation=False,
+                noise_suppression=False,
+                high_pass_filter=False,
+                auto_gain_control=False,
+            )
+
+        _apm_off._friday_apm_off = True
+        rtc.AudioProcessingModule = _apm_off
+        print("Console APM forced OFF (passthrough)", flush=True)
+    except Exception as e:
+        print(f"APM-off patch failed: {e}", flush=True)
+
+_force_console_apm_off()
+
+
 from pathlib import Path
 
 from livekit import rtc
@@ -113,6 +223,26 @@ class _ToolLeakScrubber:
         out = _TOOL_LEAK_RE.sub("", self._pending)
         self._pending = ""
         return out
+
+
+# Whisper hallucinates these on silence/noise (training-set leakage from
+# YouTube outros, subtitle files). Drop them before they reach the reply
+# pipeline or count against the speaker gate's fail-open budget.
+_WHISPER_HALLUCINATIONS = frozenset({
+    "",
+    "thank you",
+    "thanks",
+    "thanks for watching",
+    "you",
+    "bye",
+    "goodbye",
+    "amara.org",
+})
+
+
+def _is_whisper_hallucination(text: str) -> bool:
+    normalized = text.strip().lower().rstrip(".!?,").strip()
+    return normalized in _WHISPER_HALLUCINATIONS
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +320,15 @@ class FridayAgent(Agent):
 
         if not gate.enabled or self._gate_fail_open:
             async for ev in Agent.default.stt_node(self, _probed(audio), model_settings):
+                if (
+                    isinstance(ev, stt.SpeechEvent)
+                    and ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+                    and ev.alternatives
+                    and _is_whisper_hallucination(ev.alternatives[0].text)
+                ):
+                    logger.debug("Dropped Whisper hallucination: %r",
+                                 ev.alternatives[0].text[:60])
+                    continue
                 yield ev
             return
 
@@ -212,6 +351,16 @@ class FridayAgent(Agent):
                 stt.SpeechEventType.INTERIM_TRANSCRIPT,
             ):
                 yield ev
+                continue
+
+            if (
+                ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT
+                and ev.alternatives
+                and _is_whisper_hallucination(ev.alternatives[0].text)
+            ):
+                logger.debug("Dropped Whisper hallucination: %r",
+                             ev.alternatives[0].text[:60])
+                audio_buf.clear()
                 continue
 
             if audio_buf:
@@ -451,8 +600,20 @@ async def entrypoint(ctx: JobContext) -> None:
         ensure_client = getattr(tts_inst, "_ensure_client", None)
         if callable(ensure_client):
             try:
-                ensure_client()
+                _tts_client = ensure_client()
                 logger.info("Google TTS client pre-warmed")
+                # Force the grpc channel to actually CONNECT now, on the quiet boot
+                # loop, with a lightweight unary RPC. Otherwise grpc establishes the
+                # HTTP/2 connection lazily during the first greeting — and doing that
+                # under the session's concurrent load hangs forever in cygrpc
+                # initiate_stream_stream on Windows' ProactorEventLoop (confirmed via
+                # asyncio task-stack dump). Connecting here means the greeting reuses
+                # an already-open channel.
+                try:
+                    await asyncio.wait_for(_tts_client.list_voices(), timeout=20)
+                    logger.info("Google TTS grpc channel connected (warmup)")
+                except Exception as e:
+                    logger.warning("Google TTS channel warmup failed: %s", e)
             except Exception as e:
                 logger.warning("Google TTS client pre-warm failed: %s", e)
 
@@ -480,12 +641,15 @@ async def entrypoint(ctx: JobContext) -> None:
             ),
             # Verbal interruption disabled — only the launcher's PTT keybind
             # interrupts an in-flight turn (via INTERRUPT stdin command below).
-            # discard_audio_if_uninterruptible=False keeps input flowing while
-            # the agent is uninterruptible-speaking, otherwise the ready-line
-            # would eat the first ~2s of the user's reply.
+            # discard_audio_if_uninterruptible=True DROPS mic input while the
+            # agent is speaking. This is the echo guard: console AEC is forced
+            # off (it was eating the user's voice) and the per-transcript speaker
+            # gate is off, so without this the agent would transcribe its own TTS
+            # picked up by the mic and act on it. The mic is gated off during the
+            # greeting anyway, so this doesn't clip the first reply.
             interruption=InterruptionOptions(
                 enabled=False,
-                discard_audio_if_uninterruptible=False,
+                discard_audio_if_uninterruptible=True,
             ),
         ),
         tools=[core_toolset],
@@ -691,7 +855,19 @@ async def entrypoint(ctx: JobContext) -> None:
             except Exception as e:
                 logger.error("STT watchdog loop error: %s", e)
 
-    asyncio.create_task(_stt_watchdog())
+    # The watchdog assumes chunked-request STTs (Groq via OpenAI /transcriptions)
+    # where the WebSocket goes silent means it's dead. Deepgram streams
+    # continuously and can legitimately go 8+ seconds between FINAL transcripts
+    # if the user pauses mid-sentence — refreshing the stream drops in-flight
+    # audio and loses the utterance entirely.
+    # TEMP (per user request, one session): STT watchdog fully disabled to rule
+    # it out of boot problems. Restore the block below to re-enable it (only runs
+    # for chunked STTs like Groq; already skipped for deepgram/google anyway).
+    #   if STT_PROVIDER not in ("deepgram", "google"):
+    #       asyncio.create_task(_stt_watchdog())
+    #   else:
+    #       logger.info("STT watchdog disabled for streaming provider %r", STT_PROVIDER)
+    logger.info("STT watchdog TEMPORARILY DISABLED (user request, this session)")
 
     # Pre-start the session so VAD + room connection is warm before the
     # first "hey friday". Silence the mic immediately — we don't want

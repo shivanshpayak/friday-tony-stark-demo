@@ -369,7 +369,46 @@ If the goal is "Jarvis, but still fast," the next engineering wins are:
 
 ---
 
+## Debugging history & hard-won fixes (June–July 2026)
+
+A long debugging saga fixed FRIDAY going deaf/mute on Windows. Recording it so future
+work doesn't re-derive it — or worse, rip out a fix that looks unnecessary. The
+non-obvious workarounds all live at the top of `agent_friday.py` with escape hatches.
+See `ARCHITECTURE.md` §6 for the diagram version.
+
+### What broke → root cause → fix (DO NOT UNDO without reading why)
+
+| Symptom | Root cause | Fix (where) | Escape hatch |
+|---------|-----------|-------------|--------------|
+| Greeting/LLM connection **hangs forever** on activation | Windows `ProactorEventLoop` wedges when a *losing* IPv4/IPv6 "happy-eyeballs" TCP connect is **cancelled** (`_OverlappedFuture cancelled`, task stuck "cancelling"). anyio/httpx never completes the connection. | `_force_ipv4_resolution` + `_patch_anyio_happy_eyeballs` (sequential connect) — top of `agent_friday.py` | `FRIDAY_DISABLE_NET_PATCHES=1` |
+| First **Google TTS** synthesis hangs (grpc `initiate_stream_stream`) | grpc opens the HTTP/2 channel lazily on first call, under session load, and hangs | Pre-warm `list_voices()` at boot to connect the channel early | — |
+| **"Not listening"** — audio flows but STT returns nothing, no transcripts | livekit's console `AudioProcessingModule` (AEC + noise-suppression + AGC) stripped the mic to the noise floor **before the STT** (raw mic peak ~7800, frames reaching STT ~26) | `_force_console_apm_off` (passthrough APM) | `FRIDAY_KEEP_APM=1` |
+| Agent would transcribe **its own TTS** (once APM + gate off) | no echo cancellation left | echo guard: `discard_audio_if_uninterruptible=True` in the AgentSession | — |
+| Speaker gate **rejected the owner's own voice** → PTT-spam needed | enrolled profile vs. current acoustics (user relocated); per-transcript verification too strict for a single-user setup | `SESSION_SPEAKER_GATE_ENABLED = False` (config) | flip flag back to `True` |
+| Agent **fails to boot / no `FRIDAY_READY`** | a debug monkeypatch of `AudioProcessingModule.process_stream` that `print()`ed from the sounddevice **callback thread** jammed startup | removed it; patch the **constructor**, never the `process_stream` method | — |
+| Boot crash: `hey_jarvis_v0.1.onnx` missing / slow first boot | `uv run` rebuilt the venv (out of sync with lock) → wiped downloaded openWakeWord models + un-compiled `.pyc` | re-run `openwakeword.utils.download_models()`; second boot is fast | — |
+| STT session dies → FRIDAY goes deaf, no respawn | agent didn't exit on fatal close, so `agent.alive` stayed True | recovery feature: exit on `CloseReason.ERROR` → launcher respawns (`friday/recovery.py`) | — |
+| MCP tool `read_screen` times out (30s) | `server.py` is a **separate process without the net patches**; heavy Gemini-vision upload from a slow link exceeds the MCP cap | (open) shrink screenshot + fit timeout; consider applying net patches to `server.py` | — |
+
+### Debugging lessons — so future chats don't repeat the flailing
+
+- **Audio "not listening": measure the peak amplitude of frames *at `stt_node`* FIRST.** Do not assume it's the STT provider, network, sample rate, or the user's location. We burned days on those; a one-line peak probe (raw mic vs. frames-into-STT) localized it to the APM instantly.
+- **Connection hangs on Windows are usually the ProactorEventLoop connect-wedge, not the network.** Tell-tale: everything works **standalone**, only the full in-agent runtime hangs. Diagnose with `uvx py-spy dump --pid <agent_pid>` (thread stacks) and an in-process `asyncio.all_tasks()` + `task.print_stack()` dump (async await points). The thread stack just shows the idle event loop; the *task* stack shows the real wedge.
+- **Prove providers work standalone** (script that hits Gemini/Deepgram/TTS directly) to rule out network/location — but remember the bug may only surface under the agent's concurrency / mic contention. Reproduce that (e.g. hold the mic open during boot).
+- **Never `print()` from a sounddevice/PortAudio callback thread** into a piped stdout — it can deadlock boot. Instrument via the logger or a file, and patch constructors, not hot-path audio methods.
+- **`server.py` runs as its own process** and does *not* inherit `agent_friday.py`'s module-level patches. Network-calling tools can hang there independently.
+- **`uv run` may silently rebuild the venv.** Expect wiped on-demand model downloads and a slow first boot afterward.
+
+### Guardrails put in place to prevent repeats
+
+- `ARCHITECTURE.md` — diagram-based architecture; **§6 is the gotchas table**. CLAUDE.md now instructs every session to keep it updated as features change.
+- Every workaround has a **clear code comment explaining the failure it prevents** and an **env-var escape hatch** so it's reversible/testable rather than mysterious.
+- This CODEBASE.md section — the narrative record above.
+
+---
+
 ## Related docs
 
+- `ARCHITECTURE.md`: diagram-based architecture, audio pipeline, feature map, platform gotchas
 - `CAPABILITY_PLAN.md`: product direction and build order
 - `OVERLAY_REWRITE.md`: overlay design details

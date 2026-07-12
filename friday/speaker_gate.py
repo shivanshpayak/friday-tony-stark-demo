@@ -6,7 +6,9 @@ If no embedding file exists, the gate is disabled and all audio passes through.
 """
 
 import numpy as np
-from .config import VOICE_EMBEDDING_PATH, SPEAKER_SIM_THRESHOLD, logger
+from .config import (
+    VOICE_EMBEDDING_PATH, SPEAKER_SIM_THRESHOLD, SESSION_SPEAKER_GATE_ENABLED, logger,
+)
 
 
 class SessionSpeakerGate:
@@ -30,7 +32,11 @@ class SessionSpeakerGate:
 
     @property
     def enabled(self) -> bool:
-        return self._encoder is not None and self._reference is not None
+        return (
+            SESSION_SPEAKER_GATE_ENABLED
+            and self._encoder is not None
+            and self._reference is not None
+        )
 
     def verify(self, pcm_int16: np.ndarray, sample_rate: int = 16000) -> bool:
         """Return True if the audio matches the enrolled voice (or gate is off)."""

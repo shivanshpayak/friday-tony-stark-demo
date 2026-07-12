@@ -58,7 +58,7 @@ def build_stt(http_session=None, room_name=None):
         logger.info("STT → Deepgram")
         return lk_deepgram.STT()
     elif STT_PROVIDER == "groq":
-        logger.info("STT → Groq Whisper (Free Tier)")
+        logger.info("STT → Groq Whisper (turbo)")
         return lk_openai.STT(
             model="whisper-large-v3-turbo",
             api_key=os.getenv("GROQ_API_KEY"),
