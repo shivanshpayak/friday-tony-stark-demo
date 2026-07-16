@@ -132,6 +132,13 @@ flowchart LR
 muted while the agent talks (`discard_audio_if_uninterruptible=True`) so FRIDAY never
 transcribes its own voice.
 
+**Speak-before-act:** for state-changing tools (open/close app, media, messaging,
+reminders, files), the LLM emits a short spoken pre-line ("Opening Chrome, sir.")
+*before* the `tool call` edge above, then acts, then stays silent on plain success.
+This is prompt-driven (`SYSTEM_PROMPT` "ACTING OUT LOUD" rule in
+[`friday/config.py`](friday/config.py)) — LiveKit speaks text that precedes a tool
+call in the stream. Pure lookups (math, weather, search) get no pre-line.
+
 ---
 
 ## 5. Failure recovery (STT session death)
@@ -226,6 +233,15 @@ Slow / multi-step work goes to the **task layer** (quick spoken ack now, result 
 later) so it never blocks the reply path. Timers and reminders fire through the same
 session's TTS.
 
+**Loop-until-success engine** ([`friday/looping/`](friday/looping/)): a background,
+bounded, cancellable "do X until Y" runner. `run_until` (MCP, in
+[`friday/tools/loops.py`](friday/tools/loops.py)) maps a natural-language "keep doing X
+until Y" onto a curated action + success-check (`registry.py`) and spawns a daemon-thread
+loop (`runner.run_loop`, no LLM per iteration). It drives a `TaskRecord`, so the same
+file-watcher callback above speaks the loop's success/failure. Bounds are clamped
+(interval ≥1s, ≤60 attempts, ≤15 min) and ≤3 loops run at once; `stop_loop` and the kill
+switch cancel them. Generalizes the hardcoded `monitor_wifi_connection` loop.
+
 ---
 
 ## Where things live (quick index)
@@ -242,6 +258,7 @@ session's TTS.
 | Tools (features) | `friday/tools/*.py` |
 | Tool routing / domain pool | `friday/routing/` |
 | Background tasks | `friday/tasking/` |
+| Loop-until-success engine ("do X until Y") | `friday/looping/` + `friday/tools/loops.py` |
 | Timers & reminders | `friday/scheduling/` |
 | Runtime state (tasks, memory, schedules) | `runtime/` |
 | Speaker embedding | `voice_embedding.npy` / `speaker_profile.npz` |

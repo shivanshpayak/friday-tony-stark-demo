@@ -47,7 +47,7 @@ Two states: SLEEPING and ACTIVE.
 
 **ACTIVE → SLEEPING:**
 - Trigger A: 30 seconds of silence (no speech detected)
-- Trigger B: Dismissal phrase detected in STT transcript ("that'll be all friday", "stand down", "go to sleep")
+- Trigger B: Dismissal phrase detected in STT transcript ("that'll be all friday", "stand down", "go to sleep", "dismissed", "Kill yourself",)
 - Action: FRIDAY speaks a sign-off line, disconnects LiveKit session, resumes wake word listening
 
 ## Components

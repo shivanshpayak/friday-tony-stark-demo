@@ -157,16 +157,18 @@ Add a callback attribute and dismissal detection to `FridayAgent`. Insert after 
 DISMISSAL_PHRASES = [
     "that'll be all",
     "that will be all",
-    "stand down",
+    "dismissed",
     "go to sleep",
     "goodbye friday",
     "goodbye jarvis",
+    "kill yourself",
 ]
 
 SLEEP_RESPONSES = [
-    "I'll be here if you need me, boss.",
-    "Standing by, boss.",
+    "I'll be here if you need me, sir.",
+    "Standing by, sir",
     "Going quiet. You know where to find me.",
+    "Yes, Sir",
 ]
 ```
 
