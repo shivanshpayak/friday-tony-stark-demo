@@ -48,6 +48,56 @@ async def fetch_and_parse_feed(client, url):
         # If one feed fails, return an empty list so others can still succeed
         return []
 
+def open_on_screen_impl(target: str, kind: str = "auto") -> str:
+    """Pull up a URL, a Google search, or a local file/folder. See the tool
+    docstring for arg meaning. Kept module-level so it is unit-testable."""
+    import os
+    import webbrowser
+    from urllib.parse import quote_plus, urlparse
+    from friday.tools.files import _resolve_and_check
+
+    target = (target or "").strip()
+    if not target:
+        return "There's nothing to open, sir."
+
+    def _looks_like_url(t: str) -> bool:
+        if urlparse(t).scheme in ("http", "https"):
+            return True
+        return bool(re.match(r"^[\w-]+(\.[\w-]+)+(/\S*)?$", t))
+
+    def _open_url(t: str) -> str:
+        if urlparse(t).scheme not in ("http", "https"):
+            t = "https://" + t
+        webbrowser.open(t)
+        return "Pulling that up, sir."
+
+    def _open_search(t: str) -> str:
+        webbrowser.open("https://www.google.com/search?q=" + quote_plus(t))
+        return "Pulling that up, sir."
+
+    def _open_file(t: str) -> str:
+        path = _resolve_and_check(t)
+        if path is None or not path.exists():
+            return "That's outside the folders I can open, sir."
+        os.startfile(str(path))
+        return "Pulling that up, sir."
+
+    kind = (kind or "auto").lower().strip()
+    if kind == "url":
+        return _open_url(target)
+    if kind == "search":
+        return _open_search(target)
+    if kind == "file":
+        return _open_file(target)
+    # auto
+    if _looks_like_url(target):
+        return _open_url(target)
+    path = _resolve_and_check(target)
+    if path is not None and path.exists():
+        return _open_file(target)
+    return _open_search(target)
+
+
 def register(mcp):
 
     @mcp.tool()
@@ -156,3 +206,20 @@ def register(mcp):
             return f"Opening a new {doc_type} for you in the browser."
         except Exception as e:
             return f"Failed to create document: {str(e)}"
+
+    @mcp.tool()
+    def open_on_screen(target: str, kind: str = "auto") -> str:
+        """Open/"pull up" something in front of the user: a web URL, a Google
+        search, or a local file/folder. Use for "pull up X", "open X", "show me X
+        on screen", "google X and open it". First say a short line (ACTING OUT
+        LOUD), then call this.
+
+        kind: "auto" (default), "url", "search", or "file".
+        - url: opens the target URL in the default browser.
+        - search: opens a Google search for the target text.
+        - file: opens a local file (default app) or folder (Explorer), restricted
+          to Friday's allowed folders.
+        - auto: url if it looks like a link, an allowed file if it resolves to one,
+          otherwise a Google search.
+        """
+        return open_on_screen_impl(target, kind)

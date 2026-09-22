@@ -26,7 +26,7 @@ from livekit.plugins import (
 )
 from livekit.agents import APIConnectOptions
 from livekit.agents.voice.agent_session import SessionConnectOptions
-from .config import STT_MAX_RETRY, STT_TIMEOUT
+from .config import LLM_MAX_RETRY, STT_MAX_RETRY, STT_TIMEOUT
 
 
 def build_stt(http_session=None, room_name=None):
@@ -150,10 +150,13 @@ def build_session_conn_options() -> SessionConnectOptions:
 
     Widens STT retry/timeout beyond livekit defaults (max_retry=3, timeout=10)
     so a brief blip on the STT path is ridden out instead of closing the session.
+    Narrows LLM retries so an intentionally empty Gemini reply doesn't stall
+    the conversation for ~6s (see LLM_MAX_RETRY).
     """
     return SessionConnectOptions(
         stt_conn_options=APIConnectOptions(
             max_retry=STT_MAX_RETRY,
             timeout=STT_TIMEOUT,
         ),
+        llm_conn_options=APIConnectOptions(max_retry=LLM_MAX_RETRY),
     )

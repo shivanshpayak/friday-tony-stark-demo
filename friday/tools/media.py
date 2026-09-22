@@ -1,66 +1,25 @@
-"""Media control tool."""
+"""Media control tool.
+
+The volume / mute / transport primitives live in friday/media_control.py so the
+launcher's fast path can call them without importing FastMCP. This module is
+the MCP-facing wrapper.
+"""
 import ctypes
 import ctypes.wintypes
-import os
 import keyboard
 import urllib.parse
-from ctypes import cast, POINTER
-from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume, ISimpleAudioVolume
 from mcp.server.fastmcp import FastMCP
 
+from friday.media_control import (
+    _get_app_volume,
+    _get_master_volume,
+    _set_app_volume,
+    _set_master_volume,
+    next_track as _next_track,
+    play_pause_media as _play_pause_media,
+    previous_track as _previous_track,
+)
 
-def _set_master_volume(level: float) -> str:
-    """Set system master volume. level is 0.0 to 1.0."""
-    CoInitialize()
-    try:
-        volume = AudioUtilities.GetSpeakers().EndpointVolume
-        volume.SetMasterVolumeLevelScalar(max(0.0, min(1.0, level)), None)
-        return f"System volume set to {int(level * 100)}%."
-    finally:
-        CoUninitialize()
-
-
-def _get_master_volume() -> float:
-    """Return system master volume as a fraction 0.0–1.0."""
-    CoInitialize()
-    try:
-        volume = AudioUtilities.GetSpeakers().EndpointVolume
-        return float(volume.GetMasterVolumeLevelScalar())
-    finally:
-        CoUninitialize()
-
-
-def _set_app_volume(app_name: str, level: float) -> str:
-    """Set volume for a specific app. app_name is matched case-insensitively."""
-    CoInitialize()
-    try:
-        sessions = AudioUtilities.GetAllSessions()
-        needle = app_name.lower()
-        for session in sessions:
-            if session.Process and needle in session.Process.name().lower():
-                vol = session._ctl.QueryInterface(ISimpleAudioVolume)
-                vol.SetMasterVolume(max(0.0, min(1.0, level)), None)
-                return f"{session.Process.name()} volume set to {int(level * 100)}%."
-        return f"Couldn't find an audio session for '{app_name}'. It might not be playing anything right now."
-    finally:
-        CoUninitialize()
-
-
-def _get_app_volume(app_name: str) -> tuple[float, str] | None:
-    """Return (level 0.0–1.0, process_name) for the first matching app session,
-    or None if no session was found."""
-    CoInitialize()
-    try:
-        sessions = AudioUtilities.GetAllSessions()
-        needle = app_name.lower()
-        for session in sessions:
-            if session.Process and needle in session.Process.name().lower():
-                vol = session._ctl.QueryInterface(ISimpleAudioVolume)
-                return float(vol.GetMasterVolume()), session.Process.name()
-        return None
-    finally:
-        CoUninitialize()
 
 def _get_spotify_window_title() -> str | None:
     """Read the Spotify window title. Returns 'Artist - Track' when playing,
@@ -132,20 +91,17 @@ def register(mcp: FastMCP):
     @mcp.tool(name="play_pause_media")
     def play_pause_media() -> str:
         """Toggle play/pause for currently active media (like Spotify, YouTube)."""
-        keyboard.send("play/pause media")
-        return "Toggled playback."
-        
+        return _play_pause_media()
+
     @mcp.tool(name="next_track")
     def next_track() -> str:
         """Skip to the next media track."""
-        keyboard.send("next track")
-        return "Skipped to next track."
+        return _next_track()
 
     @mcp.tool(name="previous_track")
     def previous_track() -> str:
         """Go back to the previous media track."""
-        keyboard.send("previous track")
-        return "Went to previous track."
+        return _previous_track()
         
     @mcp.tool(name="current_track")
     def current_track() -> str:

@@ -29,9 +29,11 @@ import keyboard
 import numpy as np
 import pyaudio
 from dotenv import load_dotenv
-from openwakeword.model import Model as WakeWordModel
 from friday_overlay import FridayOverlay
-from friday.recovery import should_announce_recovery
+from friday.recovery import (
+    next_respawn_failures, respawn_backoff, should_announce_recovery,
+)
+from friday.config import FASTPATH_ENABLED
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +132,9 @@ load_dotenv()
 # everything: launcher logs, agent subprocess stdout, unhandled exceptions.
 # ---------------------------------------------------------------------------
 
-LOG_DIR = Path(__file__).parent / "logs"
+# FRIDAY_LOG_DIR overrides the location — the test suite sets it so importing
+# this module never writes fake entries into the real log.
+LOG_DIR = Path(os.getenv("FRIDAY_LOG_DIR") or Path(__file__).parent / "logs")
 LOG_DIR.mkdir(exist_ok=True)
 LOG_FILE = LOG_DIR / "friday.log"
 
@@ -193,6 +197,17 @@ VOICE_EMBEDDING_PATH = Path(__file__).parent / "voice_embedding.npy"
 SPEAKER_SIM_THRESHOLD = 0.70   # was 0.70 — stricter "is this the enrolled voice"
 SPEAKER_BUFFER_SECONDS = 2.5   # last N seconds of mic audio to verify against
 
+# openwakeword occasionally fires on a near-silent mic (idle, or at night).
+# A wake whose buffer never peaks above this (float, ~100 int16 LSB) cannot be
+# the user speaking: Resemblyzer scores such audio ≤ 0.63, under the threshold
+# above, so dropping it early only skips work that would be rejected anyway.
+WAKE_SILENCE_PEAK = 0.003
+
+# Agent boot. Cold boots after a reboot (disk cache empty) have run past 60s;
+# a missed window used to make the launcher exit for good. Now it retries.
+BOOT_TIMEOUT = 120.0
+BOOT_ATTEMPTS = 3
+
 
 class State(Enum):
     SLEEPING = "sleeping"
@@ -222,10 +237,20 @@ def _resolve_input_device(pa: pyaudio.PyAudio, name_substr: str) -> int | None:
     return None
 
 
+def _is_near_silent(wav_float: np.ndarray) -> bool:
+    """True when a wake buffer holds no audible sound (see WAKE_SILENCE_PEAK)."""
+    return wav_float.size == 0 or float(np.max(np.abs(wav_float))) < WAKE_SILENCE_PEAK
+
+
 class WakeWordListener:
     """Continuously listens for the wake word on the mic."""
 
     def __init__(self, model_name: str = WAKE_MODEL, threshold: float = WAKE_THRESHOLD):
+        # Imported here, not at module top: openwakeword's package import takes
+        # ~12s cold, and at module level it delayed spawning the agent by that
+        # much. Here it overlaps the agent's boot. See launcher_loop.
+        from openwakeword.model import Model as WakeWordModel
+
         # Use onnx instead of tflite — tflite-runtime has no Windows wheels.
         self._model = WakeWordModel(
             wakeword_models=[model_name],
@@ -293,6 +318,17 @@ class WakeWordListener:
         )
         return ordered.astype(np.float32) / 32768.0
 
+    def read_chunk(self) -> bytes:
+        """Read one raw AUDIO_CHUNK of int16 bytes from the open stream.
+
+        Used by the fast-path tail recognizer, which consumes the stream
+        directly after a wake-word hit. Frames read here bypass the ring
+        buffer and the wake model, so callers MUST call reset() afterwards.
+        """
+        if not self._stream:
+            self.start_stream()
+        return self._stream.read(AUDIO_CHUNK, exception_on_overflow=False)
+
     def listen_once(self) -> bool:
         """Block until wake word is detected. Returns True if detected."""
         if not self._stream:
@@ -328,6 +364,8 @@ class SpeakerVerifier:
         self._threshold = threshold
         self._encoder = None
         self._reference = None
+        # Serialises encoder use so the boot warmup can't race a wake word.
+        self._lock = threading.Lock()
         if embedding_path.exists():
             try:
                 self._reference = np.load(embedding_path)
@@ -352,12 +390,35 @@ class SpeakerVerifier:
     def enabled(self) -> bool:
         return self._encoder is not None and self._reference is not None
 
+    def warm(self) -> None:
+        """Pay Resemblyzer's JIT cost at boot instead of on the first wake word.
+
+        The first embed_utterance() call triggers librosa/numba JIT compilation
+        and takes ~4.6s; every call after is ~20ms. Without this the FIRST wake
+        word after every boot stalled ~5s inside verification — long enough to
+        blow past the agent's PREPARE handshake timeout and abort the
+        activation. Runs on a background thread during boot, where it overlaps
+        the agent subprocess's own cold start and costs nothing.
+        """
+        if not self.enabled:
+            return
+        try:
+            started = time.monotonic()
+            dummy = (np.random.randn(AUDIO_RATE) * 0.01).astype(np.float32)
+            with self._lock:
+                self._encoder.embed_utterance(dummy)
+            logger.info("Speaker verifier warm (%.1fs JIT paid at boot)",
+                        time.monotonic() - started)
+        except Exception as e:
+            logger.debug("Speaker verifier warmup failed (non-fatal): %s", e)
+
     def verify(self, wav_float: np.ndarray) -> tuple[bool, float]:
         """Return (matched, similarity). If disabled, always (True, 1.0)."""
         if not self.enabled:
             return True, 1.0
         try:
-            emb = self._encoder.embed_utterance(wav_float)
+            with self._lock:
+                emb = self._encoder.embed_utterance(wav_float)
             ref = self._reference
             sim = float(np.dot(emb, ref) / ((np.linalg.norm(emb) * np.linalg.norm(ref)) + 1e-9))
             return sim >= self._threshold, sim
@@ -434,6 +495,67 @@ def play_activation_ack():
 
 
 # ---------------------------------------------------------------------------
+# Fast-path command ack
+# ---------------------------------------------------------------------------
+
+FASTPATH_ACK_PATH = Path(__file__).parent / "sounds" / "fastpath_ack.wav"
+
+
+def _ensure_fastpath_ack_clip() -> bool:
+    """Generate the fast-path confirmation tick once.
+
+    A short, bright, decaying blip — deliberately unlike activate.wav, so the
+    fast path and a normal wake are audibly distinct.
+    """
+    if FASTPATH_ACK_PATH.exists() and FASTPATH_ACK_PATH.stat().st_size > 0:
+        return True
+    try:
+        import math
+        import wave
+
+        rate, duration, freq = 22050, 0.06, 1400.0
+        frames = bytearray()
+        total = int(rate * duration)
+        for i in range(total):
+            envelope = (1.0 - i / total) ** 2
+            sample = int(18000 * envelope * math.sin(2 * math.pi * freq * i / rate))
+            frames += sample.to_bytes(2, "little", signed=True)
+
+        FASTPATH_ACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(FASTPATH_ACK_PATH), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(bytes(frames))
+    except Exception as e:
+        logger.warning("Could not build fast-path ack clip: %s", e)
+        return False
+    logger.info("Fast-path ack clip ready (%s)", FASTPATH_ACK_PATH.name)
+    return True
+
+
+def play_fastpath_ack():
+    """Play the fast-path confirmation tick (async, non-blocking)."""
+    try:
+        winsound.PlaySound(str(FASTPATH_ACK_PATH),
+                           winsound.SND_FILENAME | winsound.SND_ASYNC)
+    except Exception as e:
+        logger.debug("Fast-path ack playback failed (non-fatal): %s", e)
+
+
+def _run_fast_action(cmd) -> None:
+    """Run a fast-path action, converting any failure into an error beep."""
+    try:
+        cmd.action()
+    except Exception as e:
+        logger.exception("fastpath action %s failed: %s", cmd.name, e)
+        try:
+            winsound.MessageBeep(winsound.MB_ICONHAND)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main launcher loop
 # ---------------------------------------------------------------------------
 
@@ -444,23 +566,35 @@ class AgentProcess:
         launcher → subprocess stdin:   START | QUIT
         subprocess stdout → launcher:  FRIDAY_READY | SESSION_STARTED |
                                        SESSION_LISTENING | SESSION_DONE |
-                                       PROCESSING | SPEAKING
+                                       SESSION_FATAL | PROCESSING | SPEAKING |
+                                       TURN_IDLE
     """
 
     def __init__(self, on_processing=None, on_speaking=None, on_listening=None,
-                 on_fatal=None):
+                 on_fatal=None, on_idle=None):
         self._proc: subprocess.Popen | None = None
         self._ready = threading.Event()
         self._session_done = threading.Event()
+        # Set on SESSION_FATAL. The agent's session is dead even if its process
+        # lingers, so it must be torn down and respawned — see needs_respawn.
+        self._fatal = threading.Event()
         self._reader_thread: threading.Thread | None = None
         self._on_processing = on_processing  # callback when LLM starts thinking
         self._on_speaking = on_speaking       # callback when first TTS content arrives
         self._on_listening = on_listening     # callback when mic is live again
         self._on_fatal = on_fatal             # callback on SESSION_FATAL (session died)
+        self._on_idle = on_idle               # callback when a turn ends with nothing said
 
     @property
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def needs_respawn(self) -> bool:
+        """True when the agent can't serve a session: its process is gone, or
+        its session died (SESSION_FATAL) — a fatal-closed agent whose process
+        didn't exit would otherwise swallow every later wake word."""
+        return not self.alive or self._fatal.is_set()
 
     def start(self):
         """Spawn the subprocess and wait for FRIDAY_READY."""
@@ -470,6 +604,7 @@ class AgentProcess:
         env["PYTHONIOENCODING"] = "utf-8"
         self._ready.clear()
         self._session_done.clear()
+        self._fatal.clear()
         self._proc = subprocess.Popen(
             [sys.executable, str(Path(__file__).parent / "agent_friday.py"), "console"],
             cwd=Path(__file__).parent,
@@ -543,8 +678,11 @@ class AgentProcess:
             self._ready.set()
         elif "SESSION_FATAL" in stripped:
             logger.error("Agent subprocess signalled SESSION_FATAL — session died, will respawn")
+            self._fatal.set()
             if self._on_fatal:
                 self._on_fatal()
+            # No SESSION_DONE follows a fatal close; release an ACTIVE wait.
+            self._session_done.set()
         elif "SESSION_STARTED" in stripped:
             logger.info("Agent subprocess signalled SESSION_STARTED")
         elif "SESSION_LISTENING" in stripped:
@@ -560,6 +698,9 @@ class AgentProcess:
         elif "SPEAKING" in stripped:
             if self._on_speaking:
                 self._on_speaking()
+        elif "TURN_IDLE" in stripped:
+            if self._on_idle:
+                self._on_idle()
         elif stripped:
             # Skip noisy LiveKit SDK internal debug lines.
             if any(p in stripped for p in self._NOISE_PATTERNS):
@@ -573,31 +714,60 @@ class AgentProcess:
             None, self._ready.wait, timeout
         )
 
-    def send_start(self):
-        """Tell the subprocess to begin a new voice session."""
+    async def boot(self, timeout: float) -> bool:
+        """Spawn the agent and wait for FRIDAY_READY. On failure the process
+        tree is killed, so a retry starts clean. Returns True when ready."""
+        self.start()
+        ready = await self.wait_ready(timeout=timeout)
+        if ready and self.alive:
+            return True
+        logger.error("Agent failed to boot (%s)",
+                     "died during boot" if not self.alive
+                     else f"no FRIDAY_READY within {timeout:.0f}s")
+        self.stop()
+        return False
+
+    def _send(self, cmd: str) -> bool:
+        """Write one protocol command to the subprocess's stdin."""
         if not self.alive:
-            logger.warning("Cannot send START — agent subprocess is dead")
-            return
-        self._session_done.clear()
-        assert self._proc and self._proc.stdin
+            logger.warning("Cannot send %s — agent subprocess is dead", cmd)
+            return False
         try:
-            self._proc.stdin.write("START\n")
+            assert self._proc and self._proc.stdin
+            self._proc.stdin.write(f"{cmd}\n")
             self._proc.stdin.flush()
+            return True
         except Exception as e:
-            logger.error("Failed to write START: %s", e)
+            logger.error("Failed to write %s: %s", cmd, e)
+            return False
+
+    def send_start(self):
+        """Tell the subprocess to begin a new voice session (prep + greeting)."""
+        self._session_done.clear()
+        return self._send("START")
 
     def send_start_recovered(self):
         """Begin a session that opens with the recovery line (post-crash respawn)."""
-        if not self.alive:
-            logger.warning("Cannot send START_RECOVERED — agent subprocess is dead")
-            return
         self._session_done.clear()
-        assert self._proc and self._proc.stdin
-        try:
-            self._proc.stdin.write("START_RECOVERED\n")
-            self._proc.stdin.flush()
-        except Exception as e:
-            logger.error("Failed to write START_RECOVERED: %s", e)
+        return self._send("START_RECOVERED")
+
+    def send_prepare(self):
+        """Begin silent prep. Must be followed by send_greet() or send_abort().
+
+        Sent the instant the wake word fires so the agent's STT reconnect
+        overlaps with the launcher's fast-path tail capture.
+        """
+        self._session_done.clear()
+        return self._send("PREPARE")
+
+    def send_greet(self):
+        """Complete a PREPARE: speak the ready line and open the mic."""
+        return self._send("GREET")
+
+    def send_abort(self):
+        """Cancel a PREPARE — the fast path handled it, or the speaker failed
+        verification. No session begins and no SESSION_DONE is printed."""
+        return self._send("ABORT")
 
     async def wait_session_done(self):
         """Block until SESSION_DONE (or subprocess death)."""
@@ -608,13 +778,8 @@ class AgentProcess:
     def send_interrupt(self):
         """Tell the subprocess to interrupt the current in-flight turn."""
         if not self.alive:
-            return
-        try:
-            assert self._proc and self._proc.stdin
-            self._proc.stdin.write("INTERRUPT\n")
-            self._proc.stdin.flush()
-        except Exception as e:
-            logger.error("Failed to write INTERRUPT: %s", e)
+            return False
+        return self._send("INTERRUPT")
 
     def stop(self):
         """Gracefully shut down the subprocess and its entire descendant tree.
@@ -651,14 +816,51 @@ class AgentProcess:
         logger.info("Agent subprocess stopped (tree killed)")
 
 
+async def boot_with_retries(agent, *, attempts: int, timeout: float,
+                            sleep=asyncio.sleep) -> bool:
+    """Boot the agent, retrying with backoff. True once it reports ready."""
+    for attempt in range(attempts):
+        if attempt:
+            delay = respawn_backoff(attempt)
+            logger.warning("Retrying agent boot in %.0fs (attempt %d/%d)",
+                           delay, attempt + 1, attempts)
+            await sleep(delay)
+        if await agent.boot(timeout):
+            return True
+    return False
+
+
+def _spawn_relaunch() -> bool:
+    """Start a fresh, detached JARVIS via the silent launcher script.
+
+    Returns False — and spawns nothing — when the script is missing: wscript.exe
+    "succeeds" even for a missing file, so the restart hotkey used to kill
+    JARVIS and leave nothing running in its place.
+    """
+    if not SILENT_LAUNCHER.exists():
+        logger.error("Restart aborted — %s is missing; JARVIS stays up",
+                     SILENT_LAUNCHER.name)
+        return False
+    # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP unlinks it from our job, so it
+    # survives us dying.
+    subprocess.Popen(
+        ["wscript.exe", str(SILENT_LAUNCHER)],
+        cwd=str(SILENT_LAUNCHER.parent),
+        creationflags=(
+            subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+        ),
+        close_fds=True,
+    )
+    return True
+
+
 async def launcher_loop():
     if _disable_power_throttling():
         logger.info("Power throttling: DISABLED (full CPU)")
     else:
         logger.warning("Power throttling: could not disable (err=%r)", _THROTTLE_ERR)
-    wakeword = WakeWordListener()
     overlay = FridayOverlay()
-    verifier = SpeakerVerifier()
     pending_recovery_cue = threading.Event()
     # Set only while a session is live (mic active / user conversing). A fatal
     # close while this is clear (idle, awaiting wake word) recovers silently.
@@ -673,9 +875,55 @@ async def launcher_loop():
         on_speaking=lambda: overlay.hide_loading(),
         on_listening=lambda: overlay.show(),
         on_fatal=_on_fatal,
+        on_idle=lambda: overlay.show(),   # silent turn ended → back to listening
     )
 
     overlay.start()
+
+    # ---- Cold boot: spawn the agent FIRST ----------------------------------
+    # Its ~20s boot is the long pole. Starting it before the launcher loads its
+    # own models (openwakeword ~12s cold, Resemblyzer, Vosk) lets the two
+    # overlap instead of adding up. The mic stream still opens only after
+    # FRIDAY_READY. Guarded by tests/test_launcher_boot_order.py.
+    overlay.show_loading("Booting up Omnicron...")
+    _ensure_boot_ack_clip()
+    boot_task = asyncio.create_task(
+        boot_with_retries(agent, attempts=BOOT_ATTEMPTS, timeout=BOOT_TIMEOUT)
+    )
+    await asyncio.sleep(0)   # let the task run up to its first await: agent spawned
+
+    try:
+        wakeword = WakeWordListener()
+        verifier = SpeakerVerifier()
+        # Pay Resemblyzer's ~4.6s JIT now, in parallel with the agent's cold
+        # boot, so the first wake word doesn't stall in verification. See warm().
+        if verifier.enabled:
+            threading.Thread(target=verifier.warm, daemon=True,
+                             name="verifier-warmup").start()
+
+        # Fast path: fixed commands ("mute", "play", "next") spoken in the same
+        # breath as the wake word run here, never reaching the agent. Import is
+        # lazy so a disabled fast path costs no vosk load at boot.
+        fastpath = None
+        if FASTPATH_ENABLED:
+            _ensure_fastpath_ack_clip()
+            try:
+                from friday.fastpath.recognizer import TailRecognizer
+
+                fastpath = TailRecognizer()
+                if not fastpath.available:
+                    fastpath = None
+            except Exception as e:
+                logger.warning("Fast path init failed (%s) — disabled", e)
+                fastpath = None
+            if fastpath is None:
+                logger.warning("Fast path unavailable — commands will route normally")
+    except BaseException:
+        # Launcher init failed — don't leave the already-spawned agent orphaned.
+        boot_task.cancel()
+        agent.stop()
+        overlay.stop()
+        raise
 
     # ---- Global hotkeys --------------------------------------------------
     # Registered on the OS hook, so they fire even when JARVIS isn't focused.
@@ -704,18 +952,9 @@ async def launcher_loop():
     def _restart_switch():
         logger.warning("RESTART pressed (%s) — relaunching to pick up code changes",
                        RESTART_HOTKEY)
-        # Spawn the silent .vbs wrapper fully detached, so it survives us dying.
-        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP unlinks it from our job.
         try:
-            subprocess.Popen(
-                ["wscript.exe", str(SILENT_LAUNCHER)],
-                cwd=str(SILENT_LAUNCHER.parent),
-                creationflags=(
-                    subprocess.DETACHED_PROCESS
-                    | subprocess.CREATE_NEW_PROCESS_GROUP
-                ),
-                close_fds=True,
-            )
+            if not _spawn_relaunch():
+                return
             logger.info("New JARVIS instance spawned — dying now")
         except Exception as e:
             logger.error("Restart spawn failed: %s", e)
@@ -760,13 +999,10 @@ async def launcher_loop():
     except Exception as e:
         logger.warning("Could not register PTT hotkey: %s", e)
 
-    # ---- One-time cold boot: spawn the agent and load models ----
-    overlay.show_loading("Booting up Omnicron...")
-    _ensure_boot_ack_clip()
-    agent.start()
-    ready = await agent.wait_ready(timeout=60.0)
-    if not ready or not agent.alive:
-        logger.error("Agent subprocess failed to start — exiting")
+    # ---- Wait for the agent boot started at the top of this function ----
+    if not await boot_task:
+        logger.error("Agent subprocess failed to start after %d attempts — exiting",
+                     BOOT_ATTEMPTS)
         overlay.stop()
         return
     overlay.hide()           # hide the initial boot overlay
@@ -775,24 +1011,38 @@ async def launcher_loop():
     wakeword.start_stream()
     state = State.SLEEPING
     recovery_started = False  # set when START_RECOVERED was already sent post-respawn
+    greet_sent = False        # PREPARE+GREET already sent; ACTIVE must not re-send
+    respawn_failures = 0      # consecutive failed respawns → backoff
+    ready_at = time.monotonic()  # when the current agent reported FRIDAY_READY
     logger.info("JARVIS launcher ready — say 'Hey Jarvis' to activate")
 
     try:
         while True:
             if state == State.SLEEPING:
-                # If the agent subprocess died between sessions, respawn it.
-                if not agent.alive:
-                    logger.warning("Agent subprocess died — respawning…")
+                # Respawn when the agent process died OR its session died
+                # (SESSION_FATAL) — a fatal-closed agent can't serve sessions
+                # even if its process lingers.
+                if agent.needs_respawn:
+                    logger.warning("Agent %s — respawning…",
+                                   "session died" if agent.alive else "subprocess died")
                     overlay.show_loading("Rebooting JARVIS...")
                     wakeword.stop_stream()
-                    agent.start()
-                    await agent.wait_ready(timeout=60.0)
+                    # An agent that died right after booting (network down at
+                    # boot) counts as a failure, so the backoff keeps growing.
+                    respawn_failures = next_respawn_failures(
+                        respawn_failures, uptime=time.monotonic() - ready_at)
+                    await asyncio.sleep(respawn_backoff(respawn_failures))
+                    agent.stop()   # no-op when already dead; kills a lingering tree
+                    if not await agent.boot(BOOT_TIMEOUT):
+                        ready_at = time.monotonic()  # boot failure = zero uptime
+                        continue   # retry after the next backoff
+                    ready_at = time.monotonic()
                     overlay.hide()
                     wakeword.start_stream()
                     # If the death was a fatal session close (SESSION_FATAL),
                     # come back speaking — re-activate with the recovery line
                     # instead of waiting silently for the next wake word.
-                    if pending_recovery_cue.is_set() and agent.alive:
+                    if pending_recovery_cue.is_set():
                         pending_recovery_cue.clear()
                         logger.info("Recovering from fatal close — re-activating with recovery line")
                         play_activation_ack()
@@ -807,6 +1057,7 @@ async def launcher_loop():
                 # both wake-word match and speaker verification.
                 if ptt_event.is_set():
                     ptt_event.clear()
+                    greet_sent = False   # PTT sends nothing; ACTIVE must send START
                     logger.info("Manual activation via PTT — bypassing wake/speaker checks")
                     play_activation_ack()
                     overlay.show_loading("Waking up...")
@@ -818,25 +1069,65 @@ async def launcher_loop():
                     None, wakeword.listen_once
                 )
                 if detected:
+                    # Snapshot the ring buffer BEFORE tail capture starts —
+                    # capture consumes the stream, so the buffer stops updating
+                    # and verification must not race it.
+                    wav = wakeword.recent_audio_float()
+
+                    # False trigger on a silent mic: drop it before it flashes
+                    # the overlay or wakes the agent. See WAKE_SILENCE_PEAK.
+                    if _is_near_silent(wav):
+                        logger.info("Wake word ignored — mic buffer is silent "
+                                    "(false trigger)")
+                        wakeword.reset()
+                        continue
+
                     # Instant visual feedback the moment the wake word is
                     # recognised; the spoken acknowledgement follows successful
                     # speaker verification.
                     overlay.show_loading("Waking up...")
+                    loop = asyncio.get_event_loop()
 
-                    if verifier.enabled:
-                        wav = wakeword.recent_audio_float()
-                        matched, sim = await asyncio.get_event_loop().run_in_executor(
-                            None, verifier.verify, wav
+                    # Send PREPARE now so the agent's STT reconnect overlaps
+                    # with tail capture instead of following it.
+                    agent.send_prepare()
+
+                    verify_task = loop.run_in_executor(None, verifier.verify, wav)
+                    if fastpath is not None:
+                        tail_task = loop.run_in_executor(
+                            None, fastpath.capture_and_match, wakeword.read_chunk
                         )
-                        if not matched:
-                            logger.info(
-                                "Wake word ignored — speaker mismatch (sim=%.3f < %.2f)",
-                                sim, SPEAKER_SIM_THRESHOLD,
-                            )
-                            overlay.hide()
-                            continue
+                    else:
+                        tail_task = asyncio.sleep(0, result=None)
+
+                    (matched, sim), fast_cmd = await asyncio.gather(
+                        verify_task, tail_task
+                    )
+
+                    if verifier.enabled and not matched:
+                        logger.info(
+                            "Wake word ignored — speaker mismatch (sim=%.3f < %.2f)",
+                            sim, SPEAKER_SIM_THRESHOLD,
+                        )
+                        agent.send_abort()
+                        overlay.hide()
+                        wakeword.reset()
+                        continue
+                    if verifier.enabled:
                         logger.info("Speaker verified (sim=%.3f)", sim)
+
+                    if fast_cmd is not None:
+                        logger.info("fastpath: executing %s", fast_cmd.name)
+                        play_fastpath_ack()
+                        await loop.run_in_executor(None, _run_fast_action, fast_cmd)
+                        agent.send_abort()
+                        overlay.hide()
+                        wakeword.reset()
+                        continue
+
                     play_activation_ack()
+                    agent.send_greet()
+                    greet_sent = True
                     state = State.ACTIVE
                     logger.info("State → ACTIVE")
 
@@ -848,8 +1139,10 @@ async def launcher_loop():
                 # The overlay shows "Waking up..." from the wake word handler;
                 # it'll switch to bars when the agent sends SPEAKING, or
                 # show "Thinking..." on PROCESSING signals.
-                if recovery_started:
-                    recovery_started = False   # START_RECOVERED already sent
+                if recovery_started or greet_sent:
+                    # START_RECOVERED, or PREPARE+GREET, already sent.
+                    recovery_started = False
+                    greet_sent = False
                 else:
                     agent.send_start()
 

@@ -8,11 +8,14 @@ Resolution layers (first hit wins):
 
 Launch uses os.startfile for .lnk targets and `cmd /c start` for pinned
 launch commands (Windows App Paths). Close uses `taskkill /F /IM <exe>` —
-exe names for discovered apps come from lazy .lnk target resolution.
+exe names for discovered apps come from lazy .lnk target resolution — except
+for File Explorer, which is closed window-by-window: explorer.exe is also the
+Windows shell (taskbar, Start, Alt+Tab), so killing it takes the desktop down.
 """
 
 from __future__ import annotations
 
+import ctypes
 import difflib
 import glob
 import logging
@@ -244,8 +247,57 @@ def launch_app(name: str) -> str:
         return f"Couldn't open {display}: {e}"
 
 
+# ---------------------------------------------------------------------------
+# Processes close_app must never kill
+# ---------------------------------------------------------------------------
+# explorer.exe hosts File Explorer windows AND the Windows shell (taskbar, Start
+# menu, Alt+Tab): `taskkill /IM explorer.exe` took the whole desktop down with
+# the folder window. File Explorer is closed by closing its windows instead.
+_FILE_EXPLORER_PROCESS = "explorer.exe"
+_FILE_EXPLORER_WINDOW_CLASS = "CabinetWClass"
+# JARVIS itself runs on these; a Start Menu "Python" shortcut resolves to them.
+_UNKILLABLE_PROCESSES = frozenset({"python.exe", "pythonw.exe", "py.exe"})
+
+_WM_CLOSE = 0x0010
+
+
+def _top_level_windows() -> list[tuple[int, str]]:
+    """(hwnd, window class) for every visible top-level window."""
+    user32 = ctypes.windll.user32
+    found: list[tuple[int, str]] = []
+    buf = ctypes.create_unicode_buffer(256)
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def _collect(hwnd, _lparam):
+        if user32.IsWindowVisible(hwnd):
+            user32.GetClassNameW(hwnd, buf, len(buf))
+            found.append((hwnd, buf.value))
+        return True
+
+    user32.EnumWindows(_collect, 0)
+    return found
+
+
+def _post_wm_close(hwnd: int) -> None:
+    ctypes.windll.user32.PostMessageW(hwnd, _WM_CLOSE, 0, 0)
+
+
+def _close_explorer_windows(windows=None, post_close=None) -> int:
+    """Close every File Explorer window (all its tabs) without touching the
+    shell process. Returns how many windows were asked to close."""
+    windows = _top_level_windows() if windows is None else windows
+    post_close = post_close or _post_wm_close
+    closed = 0
+    for hwnd, window_class in windows:
+        if window_class == _FILE_EXPLORER_WINDOW_CLASS:
+            post_close(hwnd)
+            closed += 1
+    return closed
+
+
 def close_app(name: str) -> str:
-    """Close a running desktop app by name. Uses taskkill /F."""
+    """Close a running desktop app by name. Uses taskkill /F, except for
+    File Explorer (window close) and JARVIS's own runtime (refused)."""
     resolved = _resolve(name)
     if resolved is None:
         return f"I don't see an app called {name} on this machine."
@@ -255,6 +307,13 @@ def close_app(name: str) -> str:
     if not process and source == "discovered" and "lnk" in entry:
         process = _resolve_lnk_process(entry["lnk"])
         entry["process"] = process  # cache for next time
+
+    if process and process.lower() == _FILE_EXPLORER_PROCESS:
+        if _close_explorer_windows():
+            return "Closed File Explorer."
+        return "File Explorer wasn't open."
+    if process and process.lower() in _UNKILLABLE_PROCESSES:
+        return f"I can't close {display} — I'm running on it myself."
 
     # We might still not have a process (e.g. UWP apps without .lnk).
     # We will try taskkill first if we have a process, then fallback to PowerShell.
@@ -281,13 +340,22 @@ def close_app(name: str) -> str:
             
     # Fallback for unknown processes (like UWP Store apps without .lnk)
     # We use PowerShell to find the process by its MainWindowTitle or exact ProcessName match.
+    # Protected processes are filtered out FIRST: explorer.exe's window title is
+    # whatever folder is open, so a folder named like the app matched the title
+    # branch and killed the shell.
     escaped_display = display.replace("'", "''")
     norm_disp = _normalize(display).replace("'", "''")
-    
+    protected = sorted(
+        {_FILE_EXPLORER_PROCESS, "svchost.exe", *_UNKILLABLE_PROCESSES}
+    )
+    protected_re = "|".join(re.escape(p.removesuffix(".exe")) for p in protected)
+
     script = (
-        f"Get-Process -ErrorAction SilentlyContinue | Where-Object {{ "
+        f"Get-Process -ErrorAction SilentlyContinue"
+        f" | Where-Object {{ $_.ProcessName -notmatch '^({protected_re})$' }}"
+        f" | Where-Object {{ "
         f"$_.MainWindowTitle -match '{escaped_display}' -or "
-        f"($_.ProcessName -match '{norm_disp}' -and $_.ProcessName -notmatch 'explorer|svchost') "
+        f"$_.ProcessName -match '{norm_disp}' "
         f"}} | Stop-Process -Force"
     )
     

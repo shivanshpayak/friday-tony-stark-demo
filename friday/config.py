@@ -24,6 +24,15 @@ TTS_PROVIDER       = "google"   # Gemini TTS, Charon voice
 STT_MAX_RETRY = 6
 STT_TIMEOUT   = 15.0
 
+# --- LLM retry budget ---
+# Gemini answers with an EMPTY completion when the prompt tells it to stay
+# silent (e.g. after an action plainly succeeded), and the livekit plugin treats
+# that as a retryable error. At livekit's default (3 retries, 2s apart) each
+# silent turn cost ~6s of dead air in which the user couldn't be heard, and the
+# retries almost never produced anything. One immediate retry (0.1s) still
+# covers a genuine network blip.
+LLM_MAX_RETRY = 1
+
 GEMINI_LLM_MODEL   = "gemini-2.5-flash"
 OPENAI_LLM_MODEL   = "gpt-4o"
 GROQ_LLM_MODEL     = "llama-3.1-8b-instant"
@@ -122,6 +131,45 @@ FRIDAY_FILE_ROOTS = [
 ]
 
 # ---------------------------------------------------------------------------
+# Fast-Path Voice Commands
+# ---------------------------------------------------------------------------
+# Fixed commands ("mute", "play", "next") spoken in the same breath as the wake
+# word are recognized in the launcher and executed directly — no agent session,
+# no Gemini, no TTS. See friday/fastpath/ and the design spec at
+# docs/superpowers/specs/2026-08-01-fast-path-voice-commands-design.md
+#
+# Spike 2026-08-01: Vosk emits NO partial for the first ~880ms of capture,
+# in-grammar and out alike — there is no early-reject signal before the speech
+# cap fires, so early bail was dropped. The cap does the job.
+# Also found: "unmute" is not in the model vocabulary (we use "sound on").
+
+FASTPATH_ENABLED = True
+
+# How long to wait after the wake word for the user to start a tail command.
+# No speech within this window → normal activation. This is the latency the
+# plain "Hey Jarvis <pause>" path pays, and it hides behind the agent's PREPARE.
+FASTPATH_LEAD_TIMEOUT_MS = 300
+
+# Contiguous silence that ends the tail. This is the dominant term in the
+# fast-command latency, so lower it only as far as accuracy allows.
+FASTPATH_TRAILING_SILENCE_MS = 300
+
+# Speech longer than this cannot be a fast command — abandon and activate
+# normally without decoding. Caps the latency a long request can be charged.
+FASTPATH_MAX_SPEECH_MS = 1000
+
+# webrtcvad aggressiveness, 0 (permissive) to 3 (restrictive).
+FASTPATH_VAD_AGGRESSIVENESS = 2
+
+# Percentage points per "louder"/"quieter".
+FASTPATH_VOLUME_STEP = 10
+
+# Agent-side: how long to wait for GREET/ABORT after PREPARE before assuming
+# the launcher died mid-handshake and aborting. Prevents a wedged half-
+# activated agent.
+PREPARE_WAIT_TIMEOUT = 5.0
+
+# ---------------------------------------------------------------------------
 # Speaker Verification
 # ---------------------------------------------------------------------------
 
@@ -200,14 +248,16 @@ RECOVERY_LINE_INSTRUCTIONS = (
 # Dismissal
 # ---------------------------------------------------------------------------
 
+# Matched case- and punctuation-insensitively against the transcript
+# (agent_friday._is_dismissal), so "Goodbye, Jarvis." hits "goodbye jarvis".
 DISMISSAL_PHRASES = [
     "that'll be all",
     "that will be all",
     "stand down",
     "go to sleep",
     "goodbye jarvis",
-    "Dissmissed",
-    "Kill Yourself",
+    "dismissed",
+    "kill yourself",
 ]
 
 SLEEP_RESPONSES = [

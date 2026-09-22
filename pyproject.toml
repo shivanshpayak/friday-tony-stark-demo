@@ -23,6 +23,9 @@ dependencies = [
     "python-dateutil",
     "pycaw",
     "comtypes",
+    "pyautogui",     # mouse-wheel scroll for read_long_content (scroll-capture)
+    "vosk>=0.3.45", # closed-grammar STT for launcher fast-path commands
+    "webrtcvad",    # tail endpointing (already used by friday/webrtc_vad.py, was undeclared)
 ]
 
 [project.scripts]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import sys
 from pathlib import Path
 
@@ -21,8 +22,11 @@ def _tool_name(t) -> str:
     return get_function_info(t).name
 
 
-# Maps each domain to the tool names it owns. Built once at import from the
-# same DOMAIN_MODULES registry that server.py uses, so they can never drift.
+# Maps each domain to the tool names it owns. Built from the same
+# DOMAIN_MODULES registry that server.py uses, so they can never drift.
+# Built lazily on first use: it imports and registers every tool module, which
+# cost the agent ~1.8s at startup for a map nothing reads during boot.
+@functools.cache
 def _build_domain_tool_map() -> dict[str, set[str]]:
     from mcp.server.fastmcp import FastMCP
     from friday.tools import DOMAIN_MODULES
@@ -36,7 +40,10 @@ def _build_domain_tool_map() -> dict[str, set[str]]:
     return mapping
 
 
-DOMAIN_TOOL_NAMES: dict[str, set[str]] = _build_domain_tool_map()
+def __getattr__(name: str):
+    if name == "DOMAIN_TOOL_NAMES":
+        return _build_domain_tool_map()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class _FilteredToolset(Toolset):
@@ -106,8 +113,9 @@ class LocalDomainToolPool:
 
         # Collect all tool names from the requested domains
         allowed: set[str] = set()
+        domain_tool_names = _build_domain_tool_map()
         for d in domains:
-            names = DOMAIN_TOOL_NAMES.get(d)
+            names = domain_tool_names.get(d)
             if names:
                 allowed |= names
 

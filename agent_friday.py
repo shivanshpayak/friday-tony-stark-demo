@@ -170,7 +170,7 @@ from friday.config import (
     SYSTEM_PROMPT, DISMISSAL_PHRASES, SLEEP_RESPONSES,
     STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER,
     MAX_HISTORY_ITEMS, SESSION_SPEAKER_GATE_MAX_REJECTS, logger,
-    RECOVERY_LINE_INSTRUCTIONS,
+    RECOVERY_LINE_INSTRUCTIONS, PREPARE_WAIT_TIMEOUT,
 )
 from friday.providers import build_stt, build_llm, build_tts, build_session_conn_options
 from friday.routing import LocalDomainToolPool
@@ -243,6 +243,26 @@ _WHISPER_HALLUCINATIONS = frozenset({
 def _is_whisper_hallucination(text: str) -> bool:
     normalized = text.strip().lower().rstrip(".!?,").strip()
     return normalized in _WHISPER_HALLUCINATIONS
+
+
+def _normalize_speech(text: str) -> str:
+    """Lowercase, strip punctuation (keeping apostrophes), collapse whitespace."""
+    text = text.lower().replace("’", "'")
+    return " ".join(re.sub(r"[^\w\s']", " ", text).split())
+
+
+_DISMISSAL_NORMALIZED = tuple(_normalize_speech(p) for p in DISMISSAL_PHRASES)
+
+
+def _is_dismissal(text: str) -> bool:
+    """True when the transcript contains a dismissal phrase as whole words.
+
+    Deepgram punctuates and capitalises ("Goodbye, Jarvis."), so both sides are
+    normalised; the space padding stops "stand down" matching "understand
+    download". Guarded by tests/test_dismissal.py.
+    """
+    padded = f" {_normalize_speech(text or '')} "
+    return any(f" {phrase} " in padded for phrase in _DISMISSAL_NORMALIZED)
 
 
 # ---------------------------------------------------------------------------
@@ -413,40 +433,56 @@ class FridayAgent(Agent):
         use_scrubber = LLM_PROVIDER in ("groq", "ollama")
         scrubber = _ToolLeakScrubber() if use_scrubber else None
         first_content = True
+        called_tool = False
 
-        async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
-            # Signal when first real content arrives (TTS will start speaking)
-            if (
-                first_content
-                and isinstance(chunk, lk_llm.ChatChunk)
-                and chunk.delta is not None
-                and chunk.delta.content
-            ):
-                print("SPEAKING", flush=True)
-                first_content = False
+        try:
+            async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+                if (
+                    isinstance(chunk, lk_llm.ChatChunk)
+                    and chunk.delta is not None
+                    and chunk.delta.tool_calls
+                ):
+                    called_tool = True
 
-            if (
-                scrubber
-                and isinstance(chunk, lk_llm.ChatChunk)
-                and chunk.delta is not None
-                and chunk.delta.content
-            ):
-                cleaned = scrubber.feed(chunk.delta.content)
-                if cleaned or chunk.delta.tool_calls:
-                    new_delta = chunk.delta.model_copy(
-                        update={"content": cleaned if cleaned else None}
+                # Signal when first real content arrives (TTS will start speaking)
+                if (
+                    first_content
+                    and isinstance(chunk, lk_llm.ChatChunk)
+                    and chunk.delta is not None
+                    and chunk.delta.content
+                ):
+                    print("SPEAKING", flush=True)
+                    first_content = False
+
+                if (
+                    scrubber
+                    and isinstance(chunk, lk_llm.ChatChunk)
+                    and chunk.delta is not None
+                    and chunk.delta.content
+                ):
+                    cleaned = scrubber.feed(chunk.delta.content)
+                    if cleaned or chunk.delta.tool_calls:
+                        new_delta = chunk.delta.model_copy(
+                            update={"content": cleaned if cleaned else None}
+                        )
+                        yield chunk.model_copy(update={"delta": new_delta})
+                else:
+                    yield chunk
+
+            if scrubber:
+                tail = scrubber.flush()
+                if tail:
+                    yield lk_llm.ChatChunk(
+                        id="scrub-tail",
+                        delta=lk_llm.ChoiceDelta(role="assistant", content=tail),
                     )
-                    yield chunk.model_copy(update={"delta": new_delta})
-            else:
-                yield chunk
-
-        if scrubber:
-            tail = scrubber.flush()
-            if tail:
-                yield lk_llm.ChatChunk(
-                    id="scrub-tail",
-                    delta=lk_llm.ChoiceDelta(role="assistant", content=tail),
-                )
+        finally:
+            # Nothing spoken and no tool to run (the model chose silence after
+            # an action, the LLM failed, or the turn was interrupted): tell the
+            # launcher so the overlay leaves "Thinking..." — only SPEAKING
+            # cleared it before.
+            if first_content and not called_tool:
+                print("TURN_IDLE", flush=True)
 
     # -- Greeting ---------------------------------------------------------
 
@@ -470,10 +506,13 @@ def _endpointing_delay() -> float:
 async def _stdin_dispatch_loop(session, cmd_queue: asyncio.Queue) -> None:
     """Read stdin lines and route them.
 
-    START / QUIT go to the activation queue (consumed by the activation
-    loop). INTERRUPT is handled inline by calling `session.interrupt()`
-    so it can fire mid-turn without waiting for the activation loop to
-    finish whatever it's currently awaiting.
+    START / START_RECOVERED / PREPARE / GREET / ABORT / QUIT go to the
+    activation queue (consumed by the activation loop). PREPARE begins a
+    silent prep stage that then waits for GREET (speak the ready line and open
+    the mic) or ABORT (a launcher fast-path command handled the request, or the
+    speaker failed verification — stand down). INTERRUPT is handled inline by
+    calling `session.interrupt()` so it can fire mid-turn without waiting for
+    the activation loop to finish whatever it's currently awaiting.
     """
     loop = asyncio.get_event_loop()
     while True:
@@ -492,7 +531,8 @@ async def _stdin_dispatch_loop(session, cmd_queue: asyncio.Queue) -> None:
                 logger.info("INTERRUPT received — session.interrupt(force=True) called")
             except Exception as e:
                 logger.warning("session.interrupt() failed: %s", e)
-        elif cmd in ("START", "START_RECOVERED", "QUIT"):
+        elif cmd in ("START", "START_RECOVERED", "PREPARE", "GREET",
+                     "ABORT", "QUIT"):
             await cmd_queue.put(cmd)
 
 
@@ -514,6 +554,84 @@ async def _fire_greeting(session) -> None:
         logger.info("Greeting completed")
     except Exception as e:
         logger.warning("Greeting failed: %s", e)
+
+
+# Dismissal: how long the sign-off reply may take to START playing (the model
+# can also answer with nothing), and how long it may play, before the session
+# ends anyway.
+SIGNOFF_START_TIMEOUT = 5.0
+SIGNOFF_MAX_SPEECH = 10.0
+
+
+async def _wait_for_signoff(
+    speaking: asyncio.Event,
+    finished: asyncio.Event,
+    *,
+    start_timeout: float = SIGNOFF_START_TIMEOUT,
+    max_speech: float = SIGNOFF_MAX_SPEECH,
+) -> str:
+    """Wait until the sign-off reply has started and finished playing.
+
+    Replaces a fixed 6s sleep that kept the wake word off long after a short
+    sign-off ended, and cut off a long one. Returns how the wait ended, for
+    logging. Guarded by tests/test_signoff_wait.py.
+    """
+    try:
+        await asyncio.wait_for(speaking.wait(), start_timeout)
+    except asyncio.TimeoutError:
+        return "no reply"
+    try:
+        await asyncio.wait_for(finished.wait(), max_speech)
+    except asyncio.TimeoutError:
+        return "still speaking"
+    return "played"
+
+
+_ACTIVATION_CMDS = ("START", "START_RECOVERED", "PREPARE")
+
+
+def _normalize_activation_cmd(cmd: str) -> str | None:
+    """Map a command seen in the OUTER activation wait to what to activate with.
+
+    Returns the command to activate on, or None to keep waiting. QUIT/FATAL/EOF
+    are shutdown signals and are handled by the caller before this is consulted.
+
+    GREET needs special handling: it normally arrives during a PREPARE
+    handshake, but if that handshake timed out first, the agent is back in the
+    outer wait when it lands. Treating it as unknown would shut the agent down
+    mid-session (it did — see the 2026-08-01 log), and ignoring it would hang
+    the launcher, which is already blocked in wait_session_done(). Honour it as
+    a full START instead: prep re-runs, the greeting fires, the launcher's wait
+    is satisfied.
+    """
+    if cmd in _ACTIVATION_CMDS:
+        return cmd
+    if cmd == "GREET":
+        return "START"
+    return None
+
+
+def _pre_gate_mic(session) -> None:
+    """Silence mic input BEFORE session.start(). Order matters — do not move.
+
+    During start(), LiveKit's console backend creates a ConsoleAudioInput that
+    is *attached by default* and immediately queues mic frames into an unbounded
+    channel. AgentSession._forward_audio_task drains that channel and pushes
+    every frame to the activity — it never consults input.audio_enabled. So
+    gating AFTER start() still lets the frames captured in between reach STT:
+    Deepgram endpoints that burst, emits a hallucinated transcript ("Mhmm."),
+    and the session fires a full LLM turn before the user has said anything.
+
+    Gating first makes AgentInput.audio's setter call on_detached() the moment
+    the stream is assigned, so ConsoleAudioInput.push_frame drops frames at the
+    source and no backlog can form.
+
+    Guarded by tests/test_audio_gate_ordering.py.
+    """
+    try:
+        session.input.set_audio_enabled(False)
+    except Exception as e:
+        logger.warning("Failed to pre-disable audio input: %s", e)
 
 
 def _refresh_stt_streams(stt_inst) -> None:
@@ -770,6 +888,19 @@ async def entrypoint(ctx: JobContext) -> None:
     # audio pipeline itself is wedged (not just STT).
     DEAD_PIPELINE_TIMEOUT = 15.0
 
+    # Agent speaking state, so dismissal can wait for the sign-off to finish
+    # playing instead of sleeping a fixed time. See _wait_for_signoff.
+    _agent_speaking = asyncio.Event()
+    _agent_done_speaking = asyncio.Event()
+
+    @session.on("agent_state_changed")
+    def _on_agent_state_changed(ev):
+        if ev.new_state == "speaking":
+            _agent_speaking.set()
+            _agent_done_speaking.clear()
+        elif ev.old_state == "speaking":
+            _agent_done_speaking.set()
+
     @session.on("user_input_transcribed")
     def _on_user_transcript(ev):
         nonlocal _signing_off, _last_transcript_at
@@ -777,7 +908,7 @@ async def entrypoint(ctx: JobContext) -> None:
         text = (ev.transcript or "").lower().strip()
         if dismissed.is_set() or _signing_off:
             return
-        if any(phrase in text for phrase in DISMISSAL_PHRASES):
+        if _is_dismissal(text):
             _signing_off = True
             logger.info("Dismissal detected: %r", text)
 
@@ -786,8 +917,12 @@ async def entrypoint(ctx: JobContext) -> None:
                 # The LLM already knows to say a casual sign-off for dismissal
                 # phrases (via the system prompt). Don't generate a second one —
                 # just wait for the natural response to play out, then end session.
-                await asyncio.sleep(6.0)
-                logger.info("Sign-off complete")
+                # (Mic input is discarded while the agent speaks, so it can't be
+                # mid-reply here; clearing starts a fresh speaking→done cycle.)
+                _agent_speaking.clear()
+                _agent_done_speaking.clear()
+                outcome = await _wait_for_signoff(_agent_speaking, _agent_done_speaking)
+                logger.info("Sign-off complete (%s)", outcome)
                 _signing_off = False
                 dismissed.set()
 
@@ -870,18 +1005,16 @@ async def entrypoint(ctx: JobContext) -> None:
     logger.info("STT watchdog TEMPORARILY DISABLED (user request, this session)")
 
     # Pre-start the session so VAD + room connection is warm before the
-    # first "hey friday". Silence the mic immediately — we don't want
-    # transcripts landing in the LLM before the user actually wakes it.
+    # first "hey friday". The mic is silenced BEFORE start() — gating after it
+    # lets the console audio backlog leak into STT and fire a phantom LLM turn
+    # at boot. See _pre_gate_mic.
     voice_agent = FridayAgent(stt=stt_inst, llm=llm_inst, tts=tts_inst)
+    _pre_gate_mic(session)
+    _mic_enabled = False
     await session.start(
         agent=voice_agent,
         room=ctx.room,
     )
-    try:
-        session.input.set_audio_enabled(False)
-        _mic_enabled = False
-    except Exception as e:
-        logger.warning("Failed to pre-disable audio input: %s", e)
     logger.info("Session pre-warmed, audio gated off — awaiting first START")
     print("FRIDAY_READY", flush=True)
 
@@ -908,14 +1041,30 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # ---- Activation loop (first START + every subsequent one use the same path) ----
     while True:
-        logger.info("Waiting for START command on stdin…")
+        logger.info("Waiting for activation command on stdin…")
         cmd = await cmd_queue.get()
-        if cmd not in ("START", "START_RECOVERED"):
+        if not cmd or cmd in ("QUIT", "FATAL"):
             logger.info("Received %r — shutting down", cmd or "EOF")
             break
+        activation = _normalize_activation_cmd(cmd)
+        if activation is None:
+            # Stray ABORT whose PREPARE already timed out, or anything else we
+            # don't act on. Keep waiting — never treat it as shutdown.
+            logger.info("Ignoring stray %r outside a handshake", cmd)
+            continue
+        if activation != cmd:
+            logger.warning(
+                "%r arrived outside a handshake (PREPARE timed out) — "
+                "treating it as %s so the launcher isn't left waiting",
+                cmd, activation,
+            )
+        cmd = activation
         recovered = cmd == "START_RECOVERED"
 
-        # Re-activate: clear dismissal, refresh STT, then generate the ready line
+        # ---- Prep stage: silent. No LLM, no TTS, no mic. -------------------
+        # The launcher sends PREPARE the instant the wake word fires, so this
+        # reconnect work overlaps with its fast-path tail capture instead of
+        # following it.
         _signing_off = False
         dismissed.clear()
         voice_agent._gate_reject_streak = 0
@@ -926,6 +1075,29 @@ async def entrypoint(ctx: JobContext) -> None:
             _refresh_stt_streams(stt_inst)
         except Exception as e:
             logger.warning("STT refresh failed before activation: %s", e)
+
+        # ---- Handshake stage: PREPARE waits for GREET or ABORT -------------
+        # START / START_RECOVERED skip this entirely, so the PTT and fatal-
+        # recovery paths in friday_launcher.py need no changes.
+        if cmd == "PREPARE":
+            try:
+                follow = await asyncio.wait_for(
+                    cmd_queue.get(), timeout=PREPARE_WAIT_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                # Launcher died mid-handshake. Don't sit half-activated.
+                logger.warning(
+                    "No GREET/ABORT within %.1fs — aborting activation",
+                    PREPARE_WAIT_TIMEOUT,
+                )
+                follow = "ABORT"
+            if follow in ("QUIT", "FATAL"):
+                logger.info("Received %r during handshake — shutting down", follow)
+                break
+            if follow != "GREET":
+                logger.info("Activation aborted — launcher handled it on the fast path")
+                dismissed.set()
+                continue
 
         try:
             await session.generate_reply(
@@ -977,6 +1149,15 @@ async def entrypoint(ctx: JobContext) -> None:
     except Exception:
         pass
     ctx.shutdown("stdin closed" if not _fatal[0] else "fatal session close")
+
+    # Console mode keeps the PROCESS alive after the job shuts down. The
+    # launcher respawns only when this process dies, so without an explicit
+    # exit a fatal close left a zombie agent that swallowed every later wake
+    # word (and a launcher crash/EOF left an orphan holding the mic).
+    logger.info("Agent process exiting (%s)", "fatal close" if _fatal[0] else "shutdown")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(3 if _fatal[0] else 0)
 
 
 # ---------------------------------------------------------------------------

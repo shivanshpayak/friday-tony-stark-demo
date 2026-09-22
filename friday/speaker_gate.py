@@ -20,7 +20,9 @@ class SessionSpeakerGate:
     def __init__(self) -> None:
         self._encoder = None
         self._reference = None
-        if VOICE_EMBEDDING_PATH.exists():
+        # A disabled gate never verifies anything, so don't pay for Resemblyzer
+        # (torch) at all — it was the slowest step of the agent's boot warmup.
+        if SESSION_SPEAKER_GATE_ENABLED and VOICE_EMBEDDING_PATH.exists():
             try:
                 self._reference = np.load(VOICE_EMBEDDING_PATH)
                 from resemblyzer import VoiceEncoder
