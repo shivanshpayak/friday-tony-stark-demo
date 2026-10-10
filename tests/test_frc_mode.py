@@ -67,3 +67,41 @@ class TestSpokenNames:
     def test_dashboards(self):
         assert self.resolve("Elastic") == "Elastic (WPILib) 2026"
         assert self.resolve("advantage scope") == "AdvantageScope (WPILib) 2026"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows launcher")
+class TestSpokenNamesWindows:
+    """The same spoken names on Windows, where the editor's Start Menu shortcut
+    is "2026 WPILib VS Code". FRC mode asks for "frc vs code", which resolved to
+    nothing there — so the Linux→Windows handoff opened everything but the
+    editor."""
+
+    @pytest.fixture(autouse=True)
+    def apps(self, monkeypatch):
+        from friday.tools import apps
+        entries = {
+            "wpilib vs code": {"lnk": "x.lnk", "display": "2026 WPILib VS Code", "process": None},
+            "wpilib documentation": {"lnk": "x.lnk", "display": "2026 WPILib Documentation", "process": None},
+            "elastic wpilib": {"lnk": "x.lnk", "display": "Elastic (WPILib) 2026", "process": None},
+            "advantagescope wpilib": {"lnk": "x.lnk", "display": "AdvantageScope (WPILib) 2026", "process": None},
+            "frc driver station": {"lnk": "x.lnk", "display": "FRC Driver Station", "process": None},
+            "visual studio code": {"lnk": "x.lnk", "display": "Visual Studio Code", "process": None},
+        }
+        monkeypatch.setattr(apps, "_ensure_discovered", lambda: entries)
+        self.resolve = lambda name: apps._resolve(name)[0]
+
+    @pytest.mark.parametrize("spoken", [
+        "frc vs code", "WPILib", "FRC VS Code", "FRC Visual Studio Code",
+        "WPILib VS Code", "robot code",
+    ])
+    def test_frc_editor_names(self, spoken):
+        assert self.resolve(spoken) == "2026 WPILib VS Code"
+
+    def test_plain_vs_code_is_still_plain_vs_code(self):
+        assert self.resolve("Visual Studio Code") == "vscode"
+        assert self.resolve("vs code") == "vscode"
+
+    def test_every_app_frc_mode_opens_resolves(self):
+        assert self.resolve("frc driver station") == "FRC Driver Station"
+        assert self.resolve("elastic") == "Elastic (WPILib) 2026"
+        assert self.resolve("advantagescope") == "AdvantageScope (WPILib) 2026"

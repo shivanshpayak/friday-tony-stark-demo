@@ -7,6 +7,8 @@ import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
+from . import plat
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -176,19 +178,25 @@ APP_ALIASES = {
 # everything else, because the generic matchers get these wrong: "WPILib" alone
 # matched Elastic (WPILib), and "FRC Visual Studio Code" fuzzy-matched plain
 # Visual Studio Code.
+#
+# The WPILib editor is installed under a different name on each OS: the Windows
+# Start Menu shortcut is "2026 WPILib VS Code", the Linux .desktop entry is
+# "FRC VS Code 2026". The dashboards are named the same on both.
+_FRC_EDITOR = "wpilib vs code" if os.name == "nt" else "frc vs code"
+
 APP_DISCOVERED_ALIASES = {
-    "wpilib":                 "frc vs code",
-    "wpilib vs code":         "frc vs code",
-    "wpilib vscode":          "frc vs code",
-    "wpilib code":            "frc vs code",
-    "wpilib visual studio code": "frc vs code",
-    "frc vs code":            "frc vs code",
-    "frc vscode":             "frc vs code",
-    "frc code":               "frc vs code",
-    "frc visual studio code": "frc vs code",
-    "frc visual studio":      "frc vs code",
-    "robot code":             "frc vs code",
-    "robot code editor":      "frc vs code",
+    "wpilib":                 _FRC_EDITOR,
+    "wpilib vs code":         _FRC_EDITOR,
+    "wpilib vscode":          _FRC_EDITOR,
+    "wpilib code":            _FRC_EDITOR,
+    "wpilib visual studio code": _FRC_EDITOR,
+    "frc vs code":            _FRC_EDITOR,
+    "frc vscode":             _FRC_EDITOR,
+    "frc code":               _FRC_EDITOR,
+    "frc visual studio code": _FRC_EDITOR,
+    "frc visual studio":      _FRC_EDITOR,
+    "robot code":             _FRC_EDITOR,
+    "robot code editor":      _FRC_EDITOR,
     "advantage scope":        "advantagescope wpilib",
     "advantagescope":         "advantagescope wpilib",
     "log viewer":             "advantagescope wpilib",
@@ -259,7 +267,7 @@ TEXT_TURN_TIMEOUT = 60.0
 # Speaker Verification
 # ---------------------------------------------------------------------------
 
-VOICE_EMBEDDING_PATH = Path(__file__).parents[1] / "voice_embedding.npy"
+VOICE_EMBEDDING_PATH = plat.voice_embedding_path()   # one fingerprint per OS
 SPEAKER_SIM_THRESHOLD = 0.65
 # Master switch for the in-session, per-transcript speaker verification. Turned
 # OFF: single-user setup doesn't need it, and it was rejecting the owner's own

@@ -23,6 +23,20 @@ IS_LINUX = sys.platform.startswith("linux")
 _DEVNULL = subprocess.DEVNULL
 
 
+# --- voice fingerprint -----------------------------------------------------
+
+def voice_embedding_path() -> Path:
+    """This OS's speaker fingerprint (written by enroll_voice.py).
+
+    One file per OS. The dual-boot installs share this repo through git, and
+    with a single voice_embedding.npy an enrollment on one OS replaced the
+    other's fingerprint on the next pull. Each side now enrolls, and verifies
+    the wake word, against its own file.
+    """
+    name = "windows" if IS_WINDOWS else "linux"
+    return Path(__file__).resolve().parents[1] / f"voice_embedding.{name}.npy"
+
+
 def _detached(argv: list[str], cwd: str | None = None) -> subprocess.Popen:
     """Spawn a process that outlives us and never touches our stdio."""
     return subprocess.Popen(

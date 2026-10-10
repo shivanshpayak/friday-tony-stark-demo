@@ -287,6 +287,8 @@ selected at import time — nothing on the latency path changed.
 | Volume / mute | pycaw | `wpctl` (master), `pactl` sink-inputs (per-app) | `friday/media_control.py` |
 | Media transport, now-playing | media keys, Spotify window title | MPRIS over D-Bus (`busctl --user`) | `friday/media_control.py` |
 | App launch / close | Start Menu `.lnk`, `taskkill` | `.desktop` entries, SIGTERM by process name | `friday/tools/apps_linux.py` |
+| WPILib editor's installed name | `2026 WPILib VS Code` | `FRC VS Code 2026` | `APP_DISCOVERED_ALIASES` (`friday/config.py`), checked first by both `_resolve`s |
+| Speaker fingerprint | `voice_embedding.windows.npy` | `voice_embedding.linux.npy` | `plat.voice_embedding_path`, `enroll_voice.py` |
 | PTT / restart / kill | global hotkeys (`keyboard`) | signals SIGUSR2 / SIGHUP / SIGTERM (not SIGUSR1 — the PipeWire client blocks it) via `friday_ctl` + `runtime/friday.pid` | `friday_launcher.py`, `friday_ctl.py` |
 | Overlay | Tk + Win32 layered windows | Qt subprocess `friday_overlay_qt.py`, fed state names over stdin | `friday_overlay.py` |
 | Autostart / relaunch | Task Scheduler, `start_friday.vbs` | `~/.config/autostart/jarvis.desktop`, `start_friday.sh` | `install_startup.py` |
@@ -313,6 +315,12 @@ Linux gotchas:
   drags in several GB of CUDA libraries for a 2.5s speaker embedding.
 - **The FRC Driver Station is Windows-only**; other dashboards launch from the
   WPILib `.desktop` entries.
+- **One speaker fingerprint per OS.** Both installs share this repo through git,
+  and a single `voice_embedding.npy` meant enrolling on one OS replaced the
+  other's fingerprint on the next pull. The launcher's wake gate, the in-session
+  gate and `enroll_voice.py` all take the path from `plat.voice_embedding_path()`,
+  so run `enroll_voice.py` once on each OS. On Windows it finds the running
+  launcher by command line (no PID file there) to stop and restart it.
 
 ## 6b. Quiet mode and typed requests
 
@@ -491,5 +499,5 @@ switch cancel them. Generalizes the hardcoded `monitor_wifi_connection` loop.
 | Scroll-capture engine (read past the viewport) | `friday/screen_scroll.py` + `read_long_content` in `friday/tools/screen.py` |
 | Timers & reminders | `friday/scheduling/` |
 | Runtime state (tasks, memory, schedules) | `runtime/` |
-| Speaker embedding | `voice_embedding.npy` / `speaker_profile.npz` |
+| Speaker fingerprint (one per OS) | `voice_embedding.windows.npy` / `voice_embedding.linux.npy` |
 | Logs | `logs/friday.log` |

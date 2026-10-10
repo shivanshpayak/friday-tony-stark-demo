@@ -54,7 +54,7 @@ class HandoffTask:
     request: str                       # what to do, as you'd say it to JARVIS
     target_os: str                     # "windows" | "linux" | "any"
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    created_on: str = field(default_factory=current_os)
+    created_on: str = field(default_factory=lambda: current_os())
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat())
     status: str = "pending"            # pending | done | failed | expired

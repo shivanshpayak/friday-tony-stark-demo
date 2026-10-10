@@ -215,7 +215,7 @@ SESSION_MIC = os.getenv("SESSION_MIC", "").strip()
 # MCP server no longer needed — tools are registered directly on the agent
 
 # Speaker verification
-VOICE_EMBEDDING_PATH = Path(__file__).parent / "voice_embedding.npy"
+VOICE_EMBEDDING_PATH = plat.voice_embedding_path()   # one fingerprint per OS
 SPEAKER_SIM_THRESHOLD = 0.70   # was 0.70 — stricter "is this the enrolled voice"
 SPEAKER_BUFFER_SECONDS = 2.5   # last N seconds of mic audio to verify against
 

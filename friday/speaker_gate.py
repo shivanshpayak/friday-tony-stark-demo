@@ -1,7 +1,8 @@
 """
 In-session speaker verification using Resemblyzer voice embeddings.
 
-Compares incoming audio against the enrolled voice (voice_embedding.npy).
+Compares incoming audio against the enrolled voice (this OS's fingerprint —
+see plat.voice_embedding_path).
 If no embedding file exists, the gate is disabled and all audio passes through.
 """
 

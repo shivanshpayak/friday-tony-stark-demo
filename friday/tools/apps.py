@@ -25,7 +25,7 @@ import subprocess
 import threading
 from typing import Optional
 
-from friday.config import APP_WHITELIST, APP_ALIASES
+from friday.config import APP_WHITELIST, APP_ALIASES, APP_DISCOVERED_ALIASES
 
 log = logging.getLogger("friday-agent")
 
@@ -157,6 +157,15 @@ def _resolve(name: str) -> Optional[tuple[str, dict, str]]:
     needle = (name or "").strip().lower()
     if not needle:
         return None
+
+    # 0. Spoken alias for a discovered app ("frc vs code" -> 2026 WPILib VS
+    #    Code). First, because every later layer has a plausible wrong answer
+    #    for these — same rule as apps_linux._resolve.
+    target = APP_DISCOVERED_ALIASES.get(_normalize(needle))
+    if target:
+        entry = _ensure_discovered().get(target)
+        if entry is not None:
+            return entry["display"], entry, "discovered"
 
     # 1. Pinned: exact key
     if needle in APP_WHITELIST:

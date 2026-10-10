@@ -19,6 +19,10 @@ third were rejected). Enrolling on the same kind of clip closes that gap.
 
 A running JARVIS is stopped first (it would answer every "Hey Jarvis") and
 started again at the end with the new fingerprint.
+
+Windows and Linux each keep their own fingerprint (voice_embedding.windows.npy
+/ voice_embedding.linux.npy), so enroll once on each OS — enrolling on one
+never changes the other.
 """
 
 import os
@@ -32,9 +36,11 @@ from pathlib import Path
 import numpy as np
 import pyaudio
 
+from friday import plat
+
 ROOT = Path(__file__).parent
-OUTPUT_PATH = ROOT / "voice_embedding.npy"
-BACKUP_PATH = ROOT / "voice_embedding.previous.npy"
+OUTPUT_PATH = plat.voice_embedding_path()   # this OS's fingerprint
+BACKUP_PATH = OUTPUT_PATH.with_name(OUTPUT_PATH.stem + ".previous.npy")
 PID_FILE = ROOT / "runtime" / "friday.pid"
 
 # These mirror friday_launcher.py — the clips must be captured the way the
@@ -56,7 +62,36 @@ STYLES = [
 ]
 
 
+def _windows_launcher_pids() -> list[int]:
+    """Running launcher processes, found by command line.
+
+    The launcher only writes its PID file on Linux (Windows drives it with
+    hotkeys), so on Windows the stop below used to find nothing and JARVIS
+    answered every enrollment sample.
+    """
+    import psutil
+
+    pids = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        name = (proc.info["name"] or "").lower()
+        cmdline = " ".join(proc.info["cmdline"] or []).lower()
+        if name.startswith("python") and (
+                "friday_start" in cmdline or "friday_launcher" in cmdline):
+            pids.append(proc.info["pid"])
+    return pids
+
+
 def _stop_running_jarvis() -> bool:
+    if plat.IS_WINDOWS:
+        pids = _windows_launcher_pids()
+        for pid in pids:
+            try:
+                plat.kill_tree(pid)   # launcher, agent and tool server
+            except Exception:
+                pass
+        if pids:
+            time.sleep(1.0)   # let it release the mic
+        return bool(pids)
     try:
         pid = int(PID_FILE.read_text(encoding="utf-8").strip())
         os.kill(pid, signal.SIGTERM)
@@ -73,6 +108,17 @@ def _stop_running_jarvis() -> bool:
 
 
 def _restart_jarvis() -> None:
+    if plat.IS_WINDOWS:
+        script = ROOT / "start_friday.vbs"
+        if not script.exists():
+            return
+        # Same detached spawn as the launcher's restart hotkey.
+        subprocess.Popen(
+            ["wscript.exe", str(script)], cwd=str(ROOT),
+            creationflags=(subprocess.DETACHED_PROCESS
+                           | subprocess.CREATE_NEW_PROCESS_GROUP),
+            close_fds=True)
+        return
     script = ROOT / "start_friday.sh"
     if not script.exists():
         return
