@@ -9,6 +9,7 @@ CLAUDE.md
 credentials.json
 token.json
 friday-493612-*.json
+friday-tts-key.json
 logs/
 runtime/
 sounds/booting_ack.wav

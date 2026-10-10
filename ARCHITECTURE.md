@@ -10,7 +10,7 @@
 
 ## 1. System overview — three cooperating processes
 
-FRIDAY is a Windows voice assistant that runs as **three processes**. The launcher
+FRIDAY is a voice assistant (Windows and Linux — see §6a) that runs as **three processes**. The launcher
 owns the machine-facing bits (mic, hotkeys, overlay) and supervises a long-lived
 agent; the agent runs one LiveKit voice session and talks to a local MCP tool server.
 
@@ -74,6 +74,7 @@ sequenceDiagram
     Note over A: apply Windows net patches (IPv4-only, sequential connect)<br/>+ force console APM OFF  (module import, before livekit)
     A->>A: warm providers (STT/LLM/TTS) + speaker gate (parallel;<br/>gate skips Resemblyzer entirely while disabled)
     A->>A: pre-warm Google TTS grpc channel (list_voices)  ← avoids first-call hang
+    A->>A: pre-render wake lines (background; disk cache, ~20ms warm)
     A->>S: spawn server.py, register core toolset
     A->>A: session.start() — acquire console audio, mic gated OFF
     A-->>L: FRIDAY_READY
@@ -94,6 +95,15 @@ to pull LiveKit + Google Cloud into the tool server, ~22s cold). Guarded by
 `tests/test_boot_imports.py`. The launcher waits up to `BOOT_TIMEOUT` (120s) and
 retries a failed boot `BOOT_ATTEMPTS` times with backoff instead of exiting — cold
 boots after a reboot have exceeded the old fixed 60s.
+
+`friday/providers.py` imports **only the plugins this config selects**
+(`_register_selected_plugins`, `LOADED_PLUGINS`) — importing all four cost an extra
+1.0s of boot (measured 2026-09-22) for providers that are never built. These must be
+imported at module level, on the **main thread**: a livekit plugin registers itself on
+import and `Plugin.register_plugin` raises *"Plugins must be registered on the main
+thread"*, while `build_stt/llm/tts` run in `run_in_executor` worker threads. Moving the
+imports into the `build_*` branches therefore breaks boot outright — guarded by
+`test_providers_can_be_built_off_the_main_thread`.
 
 ---
 
@@ -116,6 +126,22 @@ stateDiagram-v2
 
 - **Activation** requires the enrolled voice at the **wake word** (launcher's speaker
   verify) *or* a PTT keypress (bypasses verify).
+- **The ready line is the wake→listening latency** — the mic is only enabled once it
+  finishes playing. It used to be `session.generate_reply(READY_LINE_INSTRUCTIONS)`:
+  a Gemini round-trip to improvise one of three phrases the prompt already listed,
+  then a TTS synthesis of the result — 3.43–5.30s per wake (median 3.76s, n=5, from
+  `logs/friday.log` 2026-09-22). The phrases are now fixed (`READY_RESPONSES`),
+  rendered once by `friday/voice_cache.py` into `runtime/voice_cache/*.wav`, and
+  replayed with `session.say(text, audio=...)`, which skips both round-trips — the
+  wait becomes the line's own playout (1.2–1.6s). Falls back to the live path on a
+  cold cache; **recovery** keeps the live path deliberately, since its line has to
+  acknowledge the drop that just happened.
+  Two constraints on `READY_RESPONSES`, both guarded by `tests/test_ready_line.py`:
+  keep each line **short** (it sits on the wake path) and **one sentence** — Gemini
+  TTS's streaming plugin segments multi-sentence input and then fails the render with
+  *"no audio frames were pushed"*, so such a line would never cache.
+  The cache is keyed by `providers.tts_voice_id()`, so retuning the voice
+  (`GOOGLE_TTS_*` in `friday/config.py`) re-renders instead of replaying the old one.
 - **Silent-mic false wakes** are dropped before verification: openwakeword
   occasionally fires on a near-silent mic, and a wake buffer that never peaks above
   `WAKE_SILENCE_PEAK` is ignored without flashing the overlay or sending `PREPARE`
@@ -245,6 +271,112 @@ Code: [`friday/recovery.py`](friday/recovery.py) (`is_fatal_close`, `should_anno
 
 ---
 
+## 6a. Linux port (KDE Plasma / Wayland / PipeWire)
+
+Same three processes, same protocol. Only the OS plumbing differs, and it is
+selected at import time — nothing on the latency path changed.
+
+| Concern | Windows | Linux | Where |
+|---|---|---|---|
+| Chimes / beeps | `winsound` | `pw-play` / `paplay` / `aplay` | `friday/plat.py` |
+| Open file / URL / URI | `os.startfile` | `xdg-open` | `friday/plat.py` |
+| Kill agent tree | `taskkill /T /F` | agent is a session leader → `killpg` + psutil descendants | `friday/plat.py`, `AgentProcess` |
+| Visible task terminal | `CREATE_NEW_CONSOLE` | `konsole --hold -e` (fallbacks) | `plat.open_terminal` |
+| Clipboard | Win32 API | `wl-copy`/`wl-paste`, Klipper D-Bus fallback | `friday/tools/clipboard.py` |
+| Screenshot | `ImageGrab` | `spectacle --background` (Wayland blocks direct grabs) | `plat.grab_screen` |
+| Volume / mute | pycaw | `wpctl` (master), `pactl` sink-inputs (per-app) | `friday/media_control.py` |
+| Media transport, now-playing | media keys, Spotify window title | MPRIS over D-Bus (`busctl --user`) | `friday/media_control.py` |
+| App launch / close | Start Menu `.lnk`, `taskkill` | `.desktop` entries, SIGTERM by process name | `friday/tools/apps_linux.py` |
+| PTT / restart / kill | global hotkeys (`keyboard`) | signals SIGUSR2 / SIGHUP / SIGTERM (not SIGUSR1 — the PipeWire client blocks it) via `friday_ctl` + `runtime/friday.pid` | `friday_launcher.py`, `friday_ctl.py` |
+| Overlay | Tk + Win32 layered windows | Qt subprocess `friday_overlay_qt.py`, fed state names over stdin | `friday_overlay.py` |
+| Autostart / relaunch | Task Scheduler, `start_friday.vbs` | `~/.config/autostart/jarvis.desktop`, `start_friday.sh` | `install_startup.py` |
+
+Linux gotchas:
+
+- **The tool server needs the session environment.** The MCP stdio client gives
+  `server.py` only HOME/PATH/USER-style variables by default. Without `DISPLAY`,
+  `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS`, launched
+  apps crash on start (VS Code core-dumped) and MPRIS, clipboard and screenshot
+  calls fail. `plat.tool_server_env()` passes the full environment.
+- **No global hotkeys on Wayland.** Ordinary apps can't hook keys system-wide and
+  the `keyboard` package needs root. Bind `friday_ctl ptt|restart|kill` to
+  shortcuts in System Settings instead.
+- **Overlay runs through XWayland** (`QT_QPA_PLATFORM=xcb`). A native Wayland
+  client can't place itself, stay on top, or bypass the window manager; an X11
+  override-redirect window with an empty input region can.
+- **PySide6 is pinned `<6.12`.** 6.12.0 drops a reference to `None` on every
+  void call; on Python 3.11 (no immortal `None`) the overlay aborted after a few
+  seconds of painting.
+- **`read_long_content` can't scroll on Wayland** unless `ydotool` is installed —
+  input injection needs uinput. `read_screen` is unaffected.
+- **torch is the CPU build on Linux** (`[tool.uv.sources]`): PyPI's default wheel
+  drags in several GB of CUDA libraries for a 2.5s speaker embedding.
+- **The FRC Driver Station is Windows-only**; other dashboards launch from the
+  WPILib `.desktop` entries.
+
+## 6b. Quiet mode and typed requests
+
+**Quiet mode** (`friday/quiet.py`, state in `runtime/quiet.json`) means JARVIS
+makes no sound: the launcher drops wake-word hits and push-to-talk, and a fatal
+close recovers without the spoken recovery line. It is on automatically while
+the laptop is on a Wi-Fi network marked as school (`friday_ctl school add`). A
+manual `friday_ctl quiet on|off` overrides that, but only while the laptop stays
+on the network it was set on, so a "you may talk" granted once can't leak into
+another day's class. `friday_ctl quiet auto` clears the override.
+
+**Typed requests** reach the same session as voice, silently:
+
+```
+KRunner "j …"  ─┐
+friday_ctl ask ─┴─> runtime/friday.sock ─> launcher ─ stdin "TEXT {json}" ─> agent
+                                                                              │ session.generate_reply(user_input=…)
+reply (print / notification) <─ launcher <─ stdout "TEXT_REPLY {json}" <──────┘ with audio output disabled
+```
+
+- The agent handles `TEXT` inline in `_stdin_dispatch_loop` (like `INTERRUPT`),
+  so it works asleep or mid-conversation and never touches the activation queue.
+  Same history, tools and prompt as voice; with no voice session live, audio
+  output is switched off for the turn, so no TTS is synthesised at all.
+- The launcher matches `TEXT_REPLY` before its other stdout signals: reply text
+  is arbitrary and could contain "SPEAKING" or "PROCESSING".
+- `friday_krunner.py` is a D-Bus service (`org.kde.krunner1`, bus-activated). It
+  claims only queries starting `j ` / `jarvis `, returns a single "Ask JARVIS"
+  match without calling the model (Match fires per keystroke), and on Run
+  forwards the text and shows the reply as a notification.
+
+**Tray button** (`friday_tray.py`, Linux): a Qt `QSystemTrayIcon` in its own
+process, spawned by the launcher and tied to it through a stdin pipe (EOF →
+exit). It keeps no state: every 2s it reads `status` from the control socket
+and draws one of four icons — active, sleeping, quiet, offline. Left click
+types a request, middle click is push-to-talk, the menu toggles quiet mode and
+restarts or quits JARVIS. `FRIDAY_NO_TRAY=1` disables it.
+
+**Cross-OS handoff** (`friday/handoff.py`): the laptop dual-boots and JARVIS
+runs on both sides, but neither OS can read the other's disk (BitLocker one way,
+ext4 the other). A task for the other OS is therefore queued as an event on a
+private Google Calendar, "JARVIS Handoff", using the Calendar sign-in both sides
+already have; `FRIDAY_HANDOFF_DIR` swaps in a folder queue.
+
+```
+Linux:   "FRC mode" ─> start_frc_mode ─> handoff.leave_task("FRC mode", windows)
+                                      └> plat.restart_into_windows()  (GRUB one-shot + KDE logout)
+Windows: launcher boots ─> agent ready ─> handoff.claim_pending() ─> agent.ask(task) ─> queue.finish(done)
+```
+
+- The note is saved BEFORE the reboot is scheduled, and the reboot is checked
+  to be possible BEFORE the note is saved: never a reboot with nothing waiting,
+  never a stray task ambushing a later boot.
+- Tasks expire after 12 hours (`handoff.MAX_AGE`) and are retired unrun.
+- Pickup runs after `FRIDAY_READY` as a background task, through the silent
+  typed-request path, so it never delays the wake word and respects quiet mode.
+- `leave_task_for_other_os` (friday/tools/handoff.py) is the general tool:
+  "next time I'm on Windows, …".
+
+**FRC mode** (`start_frc_mode` in `friday/tools/frc.py`): on Windows it opens
+FRC VS Code, the Driver Station (which brings Elastic up) and AdvantageScope. On
+Linux, where the Driver Station doesn't exist, it hands off to Windows as above.
+Spoken names for these apps live in `APP_DISCOVERED_ALIASES`.
+
 ## 6. Windows / platform gotchas (applied fixes)
 
 These are non-obvious workarounds baked into `agent_friday.py`. **Do not remove without
@@ -348,6 +480,7 @@ switch cancel them. Generalizes the hardcoded `monitor_wifi_connection` loop.
 | Config (providers, prompt, thresholds, flags) | `friday/config.py` |
 | Session recovery helpers | `friday/recovery.py` |
 | Speaker gate (in-session verification) | `friday/speaker_gate.py` |
+| Pre-rendered wake lines (no LLM/TTS on wake) | `friday/voice_cache.py` → `runtime/voice_cache/*.wav` |
 | Fast-path voice commands (launcher, no LLM) | `friday/fastpath/` — command table in `registry.py` |
 | Shared media control (volume, mute, transport) | `friday/media_control.py` |
 | Vosk model (fast path, ~40MB, gitignored) | `models/vosk-model-small-en-us-0.15/` |

@@ -13,6 +13,7 @@ from livekit.agents.llm.tool_context import (
     is_raw_function_tool,
 )
 
+from friday import plat
 from friday.routing.domains import DOMAINS
 
 
@@ -86,6 +87,7 @@ class LocalDomainToolPool:
             mcp_server=MCPServerStdio(
                 command=sys.executable,
                 args=[str(self._repo_root / "server.py")],
+                env=plat.tool_server_env(),
                 cwd=str(self._repo_root),
                 client_session_timeout_seconds=30,
             ),

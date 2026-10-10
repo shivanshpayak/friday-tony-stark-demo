@@ -5,15 +5,16 @@ import base64
 import httpx
 import pyaudio
 import asyncio
-import winsound
 from mcp.server.fastmcp import FastMCP
+
+from friday import plat
 
 
 def _ping_recording_started() -> None:
     """Short async system beep so the user knows recording started.
     Non-blocking; failures are swallowed because the ping is non-essential."""
     try:
-        winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        plat.beep("info")
     except Exception:
         pass
 

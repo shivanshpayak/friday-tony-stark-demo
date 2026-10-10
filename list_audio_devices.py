@@ -1,9 +1,9 @@
 """
-List every audio input device Windows exposes — name, index, channels, rate.
+List every audio input device the OS exposes — name, index, channels, rate.
 Use this to pick the right value for SESSION_MIC / WAKE_MIC env vars.
 
 Run:
-    .venv\\Scripts\\python.exe list_audio_devices.py
+    uv run python list_audio_devices.py
 """
 
 import pyaudio

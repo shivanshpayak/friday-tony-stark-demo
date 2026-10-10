@@ -7,9 +7,15 @@ the folder window. File Explorer must be closed by closing its windows
 (class CabinetWClass), never by killing the process. Same class of bug: a Start
 Menu "Python" shortcut resolves to python.exe, which is what JARVIS runs on.
 """
+import sys
+
 import pytest
 
-from friday.tools import apps
+import friday.tools.apps as apps  # the Windows implementation, on any OS
+
+pytestmark = pytest.mark.skipif(
+    sys.platform != "win32", reason="Win32 close path; Linux: test_apps_linux.py"
+)
 
 
 class _Recorder:

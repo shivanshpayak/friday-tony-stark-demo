@@ -46,6 +46,52 @@ def test_tasking_models_import_is_lightweight():
     assert _modules_loaded_after("import friday.tasking.models", VOICE_STACK) == []
 
 
+def test_providers_does_not_import_unselected_plugins():
+    """friday.providers used to import deepgram+google+openai+sarvam at module
+    level, though only one of each is ever built. livekit.plugins.openai alone
+    was ~0.85s of boot (measured 2026-09-22) for a provider this config never
+    selects. Each branch imports its own plugin now."""
+    from friday.config import STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER
+
+    selected = {STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER}
+    # "gemini" selects the google plugin; groq/whisper select the openai one.
+    plugin_of = {"gemini": "google", "groq": "openai", "whisper": "openai"}
+    in_use = {plugin_of.get(p, p) for p in selected}
+
+    unused = [f"livekit.plugins.{p}"
+              for p in ("deepgram", "google", "openai", "sarvam")
+              if p not in in_use]
+    assert unused, "config selects every plugin; this guard would prove nothing"
+
+    assert _modules_loaded_after("import friday.providers", unused) == []
+
+
+def test_building_the_configured_providers_still_resolves_its_plugin():
+    """Lazy imports must not leave a branch referencing an unimported name."""
+    from friday.providers import build_stt, build_llm, build_tts
+
+    for build in (build_stt, build_llm, build_tts):
+        assert build() is not None
+
+
+def test_providers_can_be_built_off_the_main_thread():
+    """agent_friday warms STT/LLM/TTS via loop.run_in_executor, so build_*()
+    runs on worker threads. livekit's Plugin.register_plugin raises
+    "Plugins must be registered on the main thread" if a plugin is first
+    imported there — so the selected plugins must already be registered by the
+    time providers is imported. Moving the plugin imports into the build_*
+    branches broke boot outright; this is the guard.
+    """
+    import concurrent.futures
+
+    from friday.providers import build_stt, build_llm, build_tts
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(b) for b in (build_stt, build_llm, build_tts)]
+        for f in futures:
+            assert f.result() is not None  # re-raises RuntimeError if it broke
+
+
 def test_tasking_public_api_still_importable():
     """agent_friday does `from friday.tasking import register_toolset, ...`."""
     from friday.tasking import (  # noqa: F401

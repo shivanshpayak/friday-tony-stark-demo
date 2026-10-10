@@ -12,10 +12,17 @@ See OVERLAY_REWRITE.md for the full design spec.
 
 import ctypes
 import math
+import os
+import subprocess
+import sys
 import threading
 import time
-import tkinter as tk
 from enum import Enum
+from pathlib import Path
+
+_WIN = sys.platform == "win32"
+if _WIN:
+    import tkinter as tk
 
 # ---------------------------------------------------------------------------
 # Win32 constants
@@ -562,3 +569,89 @@ class FridayOverlay:
                 self._root.quit()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Linux: same public API, rendered by a Qt subprocess
+# ---------------------------------------------------------------------------
+
+class _SubprocessOverlay:
+    """Drives friday_overlay_qt.py over a pipe — one state name per line.
+
+    Tk has no per-pixel transparency or click-through on X11/Wayland, so Linux
+    renders with Qt instead. A missing or crashed renderer is non-fatal: the
+    overlay is cosmetic, and JARVIS must keep working without it.
+    """
+
+    _RENDERER = Path(__file__).parent / "friday_overlay_qt.py"
+
+    def __init__(self):
+        self._proc = None
+        self._state = OverlayState.SLEEPING
+        self._lock = threading.Lock()
+
+    def _send(self, state: OverlayState):
+        with self._lock:
+            self._state = state
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                return
+            try:
+                proc.stdin.write(state.value + "\n")
+                proc.stdin.flush()
+            except Exception:
+                pass
+
+    def show(self):
+        self._send(OverlayState.LISTENING)
+
+    def show_loading(self, text: str = ""):
+        lower = text.lower()
+        if "waking" in lower or "wake" in lower:
+            self._send(OverlayState.WAKING)
+        elif "thinking" in lower or "processing" in lower:
+            self._send(OverlayState.THINKING)
+        else:
+            self._send(OverlayState.BOOTING)
+
+    def hide_loading(self):
+        self._send(OverlayState.SPEAKING)
+
+    def hide(self):
+        if self._state == OverlayState.SLEEPING:
+            return
+        self._send(OverlayState.DISMISSING)
+
+    def start(self):
+        if os.environ.get("FRIDAY_NO_OVERLAY") == "1":
+            return
+        env = os.environ.copy()
+        # XWayland: lets the window sit above everything and ignore input.
+        if env.get("DISPLAY"):
+            env.setdefault("QT_QPA_PLATFORM", "xcb")
+        try:
+            self._proc = subprocess.Popen(
+                [sys.executable, str(self._RENDERER)],
+                cwd=str(self._RENDERER.parent), env=env,
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, text=True,
+            )
+        except Exception:
+            self._proc = None
+
+    def stop(self):
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()      # EOF → renderer quits
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+if not _WIN:
+    FridayOverlay = _SubprocessOverlay

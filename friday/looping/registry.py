@@ -56,7 +56,8 @@ _CALL_TOOL_SAFELIST: Dict[str, Callable[..., Any]] = {}
 def _load_safelist() -> None:
     if _CALL_TOOL_SAFELIST:
         return
-    from friday.tools.apps import launch_app
+    from friday.tools import apps
+    launch_app = apps.launch_app
     _CALL_TOOL_SAFELIST["launch_app"] = launch_app
 
 

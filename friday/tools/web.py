@@ -8,6 +8,8 @@ import asyncio  # Required for parallel execution
 import re
 from datetime import datetime
 
+from friday import plat
+
 SEED_FEEDS = [
     'https://feeds.bbci.co.uk/news/world/rss.xml',
     'https://www.cnbc.com/id/100727362/device/rss/rss.html',
@@ -79,7 +81,7 @@ def open_on_screen_impl(target: str, kind: str = "auto") -> str:
         path = _resolve_and_check(t)
         if path is None or not path.exists():
             return "That's outside the folders I can open, sir."
-        os.startfile(str(path))
+        plat.open_target(str(path))
         return "Pulling that up, sir."
 
     kind = (kind or "auto").lower().strip()
@@ -202,7 +204,7 @@ def register(mcp):
         
         target = mapping.get(doc_type, "https://docs.new") # Default to doc
         try:
-            os.startfile(target)
+            plat.open_target(target)
             return f"Opening a new {doc_type} for you in the browser."
         except Exception as e:
             return f"Failed to create document: {str(e)}"

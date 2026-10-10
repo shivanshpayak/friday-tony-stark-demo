@@ -197,15 +197,11 @@ def register(mcp):
 
         # Launch the standalone_executor in a new visible cmd window
         try:
-            # We use CREATE_NEW_CONSOLE so the user can physically watch the agent think
-            creation_flags = 0
-            if os.name == "nt":
-                creation_flags = subprocess.CREATE_NEW_CONSOLE
-
-            subprocess.Popen(
+            # A new visible terminal so the user can physically watch the agent think
+            from friday import plat
+            plat.open_terminal(
                 [sys.executable, "-m", "friday.tasking.standalone_executor", task_id],
                 cwd=str(_REPO_ROOT),
-                creationflags=creation_flags
             )
             return f"Successfully spawned the background orchestrator. You should see a new command window pop up to handle task '{goal[:50]}...'."
         except Exception as e:

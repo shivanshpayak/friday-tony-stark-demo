@@ -11,6 +11,8 @@ from .config import (
     STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER,
     GEMINI_LLM_MODEL, OPENAI_LLM_MODEL, GROQ_LLM_MODEL, OLLAMA_LLM_MODEL,
     OPENAI_TTS_MODEL, OPENAI_TTS_VOICE, TTS_SPEED,
+    GOOGLE_TTS_MODEL, GOOGLE_TTS_VOICE, GOOGLE_TTS_PROMPT,
+    GOOGLE_TTS_VOLUME_GAIN_DB,
     SARVAM_TTS_LANGUAGE, SARVAM_TTS_SPEAKER,
     FAST_THINKING_BUDGET, PLANNER_THINKING_BUDGET,
     logger,
@@ -18,19 +20,63 @@ from .config import (
 
 from typing import Literal
 
-from livekit.plugins import (
-    deepgram as lk_deepgram,
-    google as lk_google,
-    openai as lk_openai,
-    sarvam,
-)
+import importlib
+
 from livekit.agents import APIConnectOptions
 from livekit.agents.voice.agent_session import SessionConnectOptions
 from .config import LLM_MAX_RETRY, STT_MAX_RETRY, STT_TIMEOUT
 
 
+# ---------------------------------------------------------------------------
+# Plugin loading
+# ---------------------------------------------------------------------------
+# Two constraints pull in opposite directions:
+#
+#  * This module used to import all four livekit plugins at module level even
+#    though only one of each kind is ever built. livekit.plugins.openai alone
+#    is ~0.85s of boot (measured 2026-09-22) for a provider this config never
+#    selects, and it sits on the critical path.
+#  * They cannot simply be imported inside the build_* branches instead:
+#    a plugin registers itself on import, and livekit's Plugin.register_plugin
+#    raises "Plugins must be registered on the main thread". agent_friday warms
+#    the providers through loop.run_in_executor, so build_*() runs on worker
+#    threads — making the branches lazy broke boot outright.
+#
+# So: import exactly the plugins this config selects, here, on the main thread
+# at import time. The `from livekit.plugins import ...` lines inside the
+# branches below are then pure sys.modules lookups that register nothing.
+# Guarded by tests/test_boot_imports.py.
+
+_PLUGIN_FOR_PROVIDER = {
+    "deepgram": "deepgram",
+    "sarvam": "sarvam",
+    "google": "google",
+    "gemini": "google",
+    "openai": "openai",
+    "whisper": "openai",   # OpenAI Whisper STT
+    "groq": "openai",      # Groq speaks the OpenAI API
+    "ollama": "openai",    # so does Ollama
+}
+
+
+def _register_selected_plugins() -> set[str]:
+    """Import (and so register) only the plugins the current config needs."""
+    loaded: set[str] = set()
+    for provider in (STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER):
+        name = _PLUGIN_FOR_PROVIDER.get(provider)
+        if name is None or name in loaded:
+            continue
+        importlib.import_module(f"livekit.plugins.{name}")
+        loaded.add(name)
+    return loaded
+
+
+LOADED_PLUGINS = _register_selected_plugins()
+
+
 def build_stt(http_session=None, room_name=None):
     if STT_PROVIDER == "sarvam":
+        from livekit.plugins import sarvam
         logger.info("STT → Sarvam Saaras v3")
         return sarvam.STT(
             language="en-IN",
@@ -41,9 +87,11 @@ def build_stt(http_session=None, room_name=None):
             http_session=http_session,
         )
     elif STT_PROVIDER == "whisper":
+        from livekit.plugins import openai as lk_openai
         logger.info("STT → OpenAI Whisper")
         return lk_openai.STT(model="whisper-1")
     elif STT_PROVIDER == "google":
+        from livekit.plugins import google as lk_google
         logger.info("STT → Google Speech-to-Text")
         sa_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
         kwargs = {}
@@ -55,9 +103,11 @@ def build_stt(http_session=None, room_name=None):
                     kwargs["credentials_info"] = json.load(f)
         return lk_google.STT(**kwargs)
     elif STT_PROVIDER == "deepgram":
+        from livekit.plugins import deepgram as lk_deepgram
         logger.info("STT → Deepgram")
         return lk_deepgram.STT()
     elif STT_PROVIDER == "groq":
+        from livekit.plugins import openai as lk_openai
         logger.info("STT → Groq Whisper (turbo)")
         return lk_openai.STT(
             model="whisper-large-v3-turbo",
@@ -72,9 +122,11 @@ def build_llm(mode: Literal["fast", "planner"] = "fast"):
     budget = PLANNER_THINKING_BUDGET if mode == "planner" else FAST_THINKING_BUDGET
     
     if LLM_PROVIDER == "openai":
+        from livekit.plugins import openai as lk_openai
         logger.info("LLM → OpenAI (%s) [mode=%s]", OPENAI_LLM_MODEL, mode)
         return lk_openai.LLM(model=OPENAI_LLM_MODEL)
     elif LLM_PROVIDER == "gemini":
+        from livekit.plugins import google as lk_google
         logger.info("LLM → Google Gemini (%s) [mode=%s, budget=%d]", GEMINI_LLM_MODEL, mode, budget)
         return lk_google.LLM(
             model=GEMINI_LLM_MODEL,
@@ -83,6 +135,7 @@ def build_llm(mode: Literal["fast", "planner"] = "fast"):
             thinking_config={"thinking_budget": budget} if budget > 0 else None,
         )
     elif LLM_PROVIDER == "groq":
+        from livekit.plugins import openai as lk_openai
         logger.info("LLM → Groq (%s)", GROQ_LLM_MODEL)
         return lk_openai.LLM(
             model=GROQ_LLM_MODEL,
@@ -90,6 +143,7 @@ def build_llm(mode: Literal["fast", "planner"] = "fast"):
             base_url="https://api.groq.com/openai/v1",
         )
     elif LLM_PROVIDER == "ollama":
+        from livekit.plugins import openai as lk_openai
         logger.info("LLM → Ollama (%s)", OLLAMA_LLM_MODEL)
         import httpx
         return lk_openai.LLM(
@@ -104,6 +158,7 @@ def build_llm(mode: Literal["fast", "planner"] = "fast"):
 
 def build_tts(http_session=None):
     if TTS_PROVIDER == "sarvam":
+        from livekit.plugins import sarvam
         logger.info("TTS → Sarvam Bulbul v3")
         return sarvam.TTS(
             target_language_code=SARVAM_TTS_LANGUAGE,
@@ -113,9 +168,11 @@ def build_tts(http_session=None):
             http_session=http_session,
         )
     elif TTS_PROVIDER == "openai":
+        from livekit.plugins import openai as lk_openai
         logger.info("TTS → OpenAI TTS (%s / %s)", OPENAI_TTS_MODEL, OPENAI_TTS_VOICE)
         return lk_openai.TTS(model=OPENAI_TTS_MODEL, voice=OPENAI_TTS_VOICE, speed=TTS_SPEED)
     elif TTS_PROVIDER == "deepgram":
+        from livekit.plugins import deepgram as lk_deepgram
         logger.info("TTS → Deepgram Aura 2")
         return lk_deepgram.TTS(
             model="aura-2-andromeda-en",
@@ -124,6 +181,7 @@ def build_tts(http_session=None):
             http_session=http_session,
         )
     elif TTS_PROVIDER == "google":
+        from livekit.plugins import google as lk_google
         logger.info("TTS → Google Gemini TTS (Charon)")
         sa_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
         kwargs = {}
@@ -134,15 +192,37 @@ def build_tts(http_session=None):
                 with open(sa_path) as f:
                     kwargs["credentials_info"] = json.load(f)
         return lk_google.TTS(
-            model_name="gemini-2.5-flash-tts",
-            voice_name="Charon",
-            prompt="Speak at a slightly brisk pace. Flow words together smoothly without over-emphasizing individual syllables. Do not speak slowly.",
+            model_name=GOOGLE_TTS_MODEL,
+            voice_name=GOOGLE_TTS_VOICE,
+            prompt=GOOGLE_TTS_PROMPT,
             speaking_rate=1.0,  # ignored by Gemini TTS — pace is controlled by prompt
-            volume_gain_db=-6.0,
+            volume_gain_db=GOOGLE_TTS_VOLUME_GAIN_DB,
             **kwargs,
         )
     else:
         raise ValueError(f"Unknown TTS_PROVIDER: {TTS_PROVIDER!r}")
+
+
+def tts_voice_id() -> str:
+    """Fingerprint of the configured voice, used to key cached audio.
+
+    friday/voice_cache.py stores pre-rendered lines under this id, so any
+    retune here (voice, model, delivery prompt, gain) invalidates them rather
+    than replaying the old voice. Every value it reads is also what build_tts
+    passes, so the two cannot drift.
+    """
+    if TTS_PROVIDER == "google":
+        parts = (GOOGLE_TTS_MODEL, GOOGLE_TTS_VOICE,
+                 f"{GOOGLE_TTS_VOLUME_GAIN_DB}", GOOGLE_TTS_PROMPT)
+    elif TTS_PROVIDER == "openai":
+        parts = (OPENAI_TTS_MODEL, OPENAI_TTS_VOICE, f"{TTS_SPEED}")
+    elif TTS_PROVIDER == "sarvam":
+        parts = ("bulbul:v3", SARVAM_TTS_SPEAKER, SARVAM_TTS_LANGUAGE, f"{TTS_SPEED}")
+    elif TTS_PROVIDER == "deepgram":
+        parts = ("aura-2-andromeda-en",)
+    else:
+        parts = ()
+    return "|".join((TTS_PROVIDER,) + tuple(parts))
 
 
 def build_session_conn_options() -> SessionConnectOptions:

@@ -5,12 +5,12 @@ launcher's fast path can call them without importing FastMCP. This module is
 the MCP-facing wrapper.
 """
 import ctypes
-import ctypes.wintypes
-import keyboard
 import urllib.parse
 from mcp.server.fastmcp import FastMCP
 
+from friday import plat
 from friday.media_control import (
+    now_playing,
     _get_app_volume,
     _get_master_volume,
     _set_app_volume,
@@ -24,6 +24,9 @@ from friday.media_control import (
 def _get_spotify_window_title() -> str | None:
     """Read the Spotify window title. Returns 'Artist - Track' when playing,
     or None if Spotify isn't running or nothing is playing."""
+    if not plat.IS_WINDOWS:
+        return now_playing("spotify") or now_playing()
+    import ctypes.wintypes
     EnumWindows = ctypes.windll.user32.EnumWindows
     GetWindowTextW = ctypes.windll.user32.GetWindowTextW
     GetWindowTextLengthW = ctypes.windll.user32.GetWindowTextLengthW
@@ -147,23 +150,16 @@ def register(mcp: FastMCP):
 
         if spotify_id:
             try:
-                import subprocess
                 import time
                 import threading
-                # Use 'start' via cmd to open spotify: URIs
                 uri = f"spotify:{type}:{spotify_id}"
-                subprocess.Popen(
-                    f'cmd /c start "" "{uri}"',
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                plat.open_target(uri)
                 # Spotify URIs navigate but don't auto-play for playlists/albums.
                 # Wait for Spotify to load, then send media play key.
                 if type in ("playlist", "album"):
                     def _delayed_play():
                         time.sleep(2.5)
-                        keyboard.send("play/pause media")
+                        _play_pause_media()
                     threading.Thread(target=_delayed_play, daemon=True).start()
                 label = {"track": "track", "playlist": "playlist", "album": "album"}.get(type, type)
                 if type == "track":
@@ -174,13 +170,7 @@ def register(mcp: FastMCP):
         else:
             escaped_query = urllib.parse.quote(query)
             try:
-                import subprocess
-                subprocess.Popen(
-                    f'cmd /c start "" "spotify:search:{escaped_query}"',
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
+                plat.open_target(f"spotify:search:{escaped_query}")
                 return f"Couldn't find an exact match, but I opened the Spotify search for '{query}'."
             except Exception as e:
                 return f"Failed to open Spotify: {e}"

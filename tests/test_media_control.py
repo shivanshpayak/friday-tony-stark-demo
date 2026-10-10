@@ -1,7 +1,16 @@
 """Tests for the shared media control layer."""
+import sys
+
+import pytest
+
 import friday.media_control as mc
 
+windows_only = pytest.mark.skipif(
+    sys.platform != "win32", reason="Windows backend; Linux: test_media_control_linux.py"
+)
 
+
+@windows_only
 def test_play_pause_sends_media_key(monkeypatch):
     sent = []
     monkeypatch.setattr(mc.keyboard, "send", lambda k: sent.append(k))
@@ -9,6 +18,7 @@ def test_play_pause_sends_media_key(monkeypatch):
     assert sent == ["play/pause media"]
 
 
+@windows_only
 def test_next_track_sends_media_key(monkeypatch):
     sent = []
     monkeypatch.setattr(mc.keyboard, "send", lambda k: sent.append(k))
@@ -16,6 +26,7 @@ def test_next_track_sends_media_key(monkeypatch):
     assert sent == ["next track"]
 
 
+@windows_only
 def test_previous_track_sends_media_key(monkeypatch):
     sent = []
     monkeypatch.setattr(mc.keyboard, "send", lambda k: sent.append(k))
@@ -23,6 +34,7 @@ def test_previous_track_sends_media_key(monkeypatch):
     assert sent == ["previous track"]
 
 
+@windows_only
 def test_stop_media_sends_media_key(monkeypatch):
     sent = []
     monkeypatch.setattr(mc.keyboard, "send", lambda k: sent.append(k))
@@ -30,6 +42,7 @@ def test_stop_media_sends_media_key(monkeypatch):
     assert sent == ["stop media"]
 
 
+@windows_only
 def test_set_master_mute_true(monkeypatch):
     calls = []
 
@@ -42,6 +55,7 @@ def test_set_master_mute_true(monkeypatch):
     assert calls == [1]
 
 
+@windows_only
 def test_set_master_mute_false(monkeypatch):
     calls = []
 

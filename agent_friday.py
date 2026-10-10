@@ -10,6 +10,7 @@ Run:
 """
 
 import asyncio
+import json
 import os
 import re
 import random
@@ -167,12 +168,15 @@ from livekit.agents.voice.turn import InterruptionOptions, EndpointingOptions
 from friday.webrtc_vad import WebRTCVAD
 
 from friday.config import (
-    SYSTEM_PROMPT, DISMISSAL_PHRASES, SLEEP_RESPONSES,
+    SYSTEM_PROMPT, DISMISSAL_PHRASES, SLEEP_RESPONSES, READY_RESPONSES,
     STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER,
     MAX_HISTORY_ITEMS, SESSION_SPEAKER_GATE_MAX_REJECTS, logger,
-    RECOVERY_LINE_INSTRUCTIONS, PREPARE_WAIT_TIMEOUT,
+    RECOVERY_LINE_INSTRUCTIONS, PREPARE_WAIT_TIMEOUT, TEXT_TURN_TIMEOUT,
 )
-from friday.providers import build_stt, build_llm, build_tts, build_session_conn_options
+from friday.providers import (
+    build_stt, build_llm, build_tts, build_session_conn_options, tts_voice_id,
+)
+from friday.voice_cache import PrerenderedLines, audio_stream
 from friday.routing import LocalDomainToolPool
 from friday.speaker_gate import get_speaker_gate
 from friday.recovery import is_fatal_close
@@ -503,7 +507,56 @@ def _endpointing_delay() -> float:
     return {"sarvam": 0.07, "whisper": 0.3}.get(STT_PROVIDER, 0.1)
 
 
-async def _stdin_dispatch_loop(session, cmd_queue: asyncio.Queue) -> None:
+_text_turn_lock = asyncio.Lock()
+
+
+def _reply_text(handle) -> str:
+    """Everything the assistant said during one generate_reply() handle."""
+    parts = []
+    for item in handle.chat_items:
+        if getattr(item, "type", "") == "message" and item.role == "assistant":
+            text = (item.text_content or "").strip()
+            if text:
+                parts.append(text)
+    return " ".join(parts)
+
+
+async def _text_turn(session, payload: str, voice_active) -> None:
+    """Answer one typed request (KRunner / `friday_ctl ask`) and print the reply.
+
+    Runs through the same session as voice — same history, same tools, same
+    prompt — but with audio output switched off, so nothing is synthesised or
+    played: this is the path that works in quiet mode. If a voice conversation
+    is already under way the audio is left alone and the reply is spoken too.
+    """
+    request_id, reply, error = None, "", None
+    try:
+        request = json.loads(payload)
+        request_id = request.get("id")
+        text = str(request.get("text", "")).strip()
+        if not text:
+            raise ValueError("empty request")
+        async with _text_turn_lock:
+            silent = not voice_active()
+            if silent:
+                session.output.set_audio_enabled(False)
+            try:
+                handle = session.generate_reply(user_input=text)
+                await asyncio.wait_for(handle, timeout=TEXT_TURN_TIMEOUT)
+                reply = _reply_text(handle)
+            finally:
+                if silent:
+                    session.output.set_audio_enabled(True)
+        logger.info("Text turn answered (%d chars)", len(reply))
+    except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+        logger.warning("Text turn failed: %s", error)
+    print("TEXT_REPLY " + json.dumps(
+        {"id": request_id, "text": reply, "error": error}), flush=True)
+
+
+async def _stdin_dispatch_loop(session, cmd_queue: asyncio.Queue,
+                               voice_active=lambda: False) -> None:
     """Read stdin lines and route them.
 
     START / START_RECOVERED / PREPARE / GREET / ABORT / QUIT go to the
@@ -520,6 +573,13 @@ async def _stdin_dispatch_loop(session, cmd_queue: asyncio.Queue) -> None:
         if not line:
             await cmd_queue.put("QUIT")
             return
+        if line.startswith("TEXT "):
+            # Typed request. Handled inline (like INTERRUPT) so it works whether
+            # or not a voice session is active, and never touches the
+            # activation queue.
+            asyncio.create_task(
+                _text_turn(session, line[len("TEXT "):], voice_active))
+            continue
         cmd = line.strip().upper()
         if cmd == "INTERRUPT":
             try:
@@ -542,6 +602,34 @@ _READY_LINE_INSTRUCTIONS = (
     "Examples: 'Done, sir. What can I help you with?', 'All set, sir. What can I do for you?', 'Ready when you are, sir.' "
     "Never use his name. Do NOT mention time, boot steps, setup, or tools. Do NOT call any tools."
 )
+
+
+async def _speak_ready_line(session, ready_lines, *, recovered: bool) -> str:
+    """Speak the wake acknowledgement; return which path produced it.
+
+    This line is the entire wake→listening wait — the mic is only enabled once
+    it finishes playing (see the activation loop). A normal wake therefore
+    replays audio pre-rendered at boot, skipping both the Gemini call and the
+    TTS synthesis that used to run here every single time.
+
+    Recovery deliberately keeps the live path: it is rare, and the line has to
+    acknowledge the drop that just happened rather than read a fixed phrase.
+    A cold/failed cache also falls back to it, so behaviour is never worse than
+    before. Guarded by tests/test_ready_line.py.
+    """
+    picked = None if recovered else ready_lines.pick()
+    if picked is not None:
+        text, frames = picked
+        await session.say(text, audio=audio_stream(frames))
+        return "pre-rendered"
+
+    await session.generate_reply(
+        instructions=(
+            RECOVERY_LINE_INSTRUCTIONS if recovered else _READY_LINE_INSTRUCTIONS
+        ),
+        tool_choice="none",
+    )
+    return "live"
 
 
 async def _fire_greeting(session) -> None:
@@ -734,6 +822,27 @@ async def entrypoint(ctx: JobContext) -> None:
                     logger.warning("Google TTS channel warmup failed: %s", e)
             except Exception as e:
                 logger.warning("Google TTS client pre-warm failed: %s", e)
+
+    # Pre-render the fixed wake lines so waking costs no LLM and no TTS call.
+    # After the first ever run this is a disk read of a few WAVs; only a cold
+    # cache (or a voice retune) synthesises, and that happens in the background
+    # with a timeout so a wedged grpc stream can never hold up boot. Until it
+    # finishes, activation just falls back to the live generate_reply path.
+    ready_lines = PrerenderedLines(tts_voice_id())
+
+    async def _warm_ready_lines() -> None:
+        try:
+            count = await asyncio.wait_for(
+                ready_lines.ensure(tts_inst, READY_RESPONSES), timeout=60
+            )
+            logger.info("Wake lines ready (%d/%d pre-rendered)",
+                        count, len(READY_RESPONSES))
+        except asyncio.TimeoutError:
+            logger.warning("Wake line pre-render timed out — using the live path")
+        except Exception as e:
+            logger.warning("Wake line pre-render failed: %s", e)
+
+    asyncio.create_task(_warm_ready_lines())
 
     # Keep a small always-on core tool surface warm, and route heavier domains
     # in only when the current request needs them.
@@ -1020,7 +1129,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
     # ---- Stdin dispatcher: handles START/QUIT (queued) and INTERRUPT (inline)
     cmd_queue: asyncio.Queue = asyncio.Queue()
-    asyncio.create_task(_stdin_dispatch_loop(session, cmd_queue))
+    asyncio.create_task(
+        _stdin_dispatch_loop(session, cmd_queue, lambda: _mic_enabled))
 
     @session.on("close")
     def _on_session_close(ev):
@@ -1100,14 +1210,9 @@ async def entrypoint(ctx: JobContext) -> None:
                 continue
 
         try:
-            await session.generate_reply(
-                instructions=(
-                    RECOVERY_LINE_INSTRUCTIONS if recovered else _READY_LINE_INSTRUCTIONS
-                ),
-                tool_choice="none",
-            )
-            logger.info("%s ready line completed",
-                        "Recovery" if recovered else "Re-activation")
+            path = await _speak_ready_line(session, ready_lines, recovered=recovered)
+            logger.info("%s ready line completed (%s)",
+                        "Recovery" if recovered else "Re-activation", path)
         except Exception as e:
             logger.warning("Ready line failed: %s", e)
 

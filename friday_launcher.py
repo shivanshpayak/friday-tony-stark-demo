@@ -12,6 +12,7 @@ Usage:
 
 import asyncio
 import ctypes
+import json
 import logging
 import logging.handlers
 import os
@@ -20,12 +21,9 @@ import subprocess
 import sys
 import threading
 import time
-import winsound
-from ctypes import wintypes
 from enum import Enum
 from pathlib import Path
 
-import keyboard
 import numpy as np
 import pyaudio
 from dotenv import load_dotenv
@@ -33,7 +31,13 @@ from friday_overlay import FridayOverlay
 from friday.recovery import (
     next_respawn_failures, respawn_backoff, should_announce_recovery,
 )
-from friday.config import FASTPATH_ENABLED
+from friday.config import FASTPATH_ENABLED, TEXT_TURN_TIMEOUT
+from friday import handoff, plat, quiet
+
+_WIN = sys.platform == "win32"
+if _WIN:
+    from ctypes import wintypes
+    import keyboard
 
 
 # ---------------------------------------------------------------------------
@@ -51,78 +55,96 @@ _ProcessPowerThrottling = 4
 # under load without starving foreground apps the way HIGH_PRIORITY would.
 _ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
 
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-_kernel32.SetProcessInformation.argtypes = [
-    wintypes.HANDLE,
-    ctypes.c_int,
-    ctypes.c_void_p,
-    wintypes.DWORD,
-]
-_kernel32.SetProcessInformation.restype = wintypes.BOOL
-_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-_kernel32.OpenProcess.restype = wintypes.HANDLE
-_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-_kernel32.CloseHandle.restype = wintypes.BOOL
-_kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-_kernel32.SetPriorityClass.restype = wintypes.BOOL
-
-
-def _bump_priority(process_handle) -> bool:
-    """Raise process to ABOVE_NORMAL so the audio thread stays scheduled."""
-    try:
-        return bool(_kernel32.SetPriorityClass(
-            process_handle, _ABOVE_NORMAL_PRIORITY_CLASS,
-        ))
-    except Exception:
-        return False
-
-
-class _POWER_THROTTLING_STATE(ctypes.Structure):
-    _fields_ = [
-        ("Version", wintypes.ULONG),
-        ("ControlMask", wintypes.ULONG),
-        ("StateMask", wintypes.ULONG),
+if _WIN:
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    _kernel32.SetProcessInformation.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
     ]
+    _kernel32.SetProcessInformation.restype = wintypes.BOOL
+    _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _kernel32.SetPriorityClass.restype = wintypes.BOOL
 
 
-def _disable_power_throttling(process_handle=None) -> bool:
-    """Tell Windows: don't throttle this process. Returns True on success."""
-    try:
-        if process_handle is None:
-            process_handle = _kernel32.GetCurrentProcess()
-        state = _POWER_THROTTLING_STATE()
-        state.Version = _PROCESS_POWER_THROTTLING_CURRENT_VERSION
-        state.ControlMask = _PROCESS_POWER_THROTTLING_EXECUTION_SPEED
-        state.StateMask = 0  # 0 = opt OUT of throttling
-        ok = _kernel32.SetProcessInformation(
-            process_handle,
-            _ProcessPowerThrottling,
-            ctypes.byref(state),
-            ctypes.sizeof(state),
-        )
-        if not ok:
-            err = ctypes.get_last_error()
-            # Stash so main() can log it once the logger is configured.
-            globals()["_THROTTLE_ERR"] = err
-        return bool(ok)
-    except Exception as e:
-        globals()["_THROTTLE_ERR"] = repr(e)
+    def _bump_priority(process_handle) -> bool:
+        """Raise process to ABOVE_NORMAL so the audio thread stays scheduled."""
+        try:
+            return bool(_kernel32.SetPriorityClass(
+                process_handle, _ABOVE_NORMAL_PRIORITY_CLASS,
+            ))
+        except Exception:
+            return False
+
+
+    class _POWER_THROTTLING_STATE(ctypes.Structure):
+        _fields_ = [
+            ("Version", wintypes.ULONG),
+            ("ControlMask", wintypes.ULONG),
+            ("StateMask", wintypes.ULONG),
+        ]
+
+
+    def _disable_power_throttling(process_handle=None) -> bool:
+        """Tell Windows: don't throttle this process. Returns True on success."""
+        try:
+            if process_handle is None:
+                process_handle = _kernel32.GetCurrentProcess()
+            state = _POWER_THROTTLING_STATE()
+            state.Version = _PROCESS_POWER_THROTTLING_CURRENT_VERSION
+            state.ControlMask = _PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            state.StateMask = 0  # 0 = opt OUT of throttling
+            ok = _kernel32.SetProcessInformation(
+                process_handle,
+                _ProcessPowerThrottling,
+                ctypes.byref(state),
+                ctypes.sizeof(state),
+            )
+            if not ok:
+                err = ctypes.get_last_error()
+                # Stash so main() can log it once the logger is configured.
+                globals()["_THROTTLE_ERR"] = err
+            return bool(ok)
+        except Exception as e:
+            globals()["_THROTTLE_ERR"] = repr(e)
+            return False
+
+else:
+    # Linux has no EcoQoS; the scheduler doesn't throttle background sessions.
+    def _bump_priority(process_handle) -> bool:
         return False
+
+    def _disable_power_throttling(process_handle=None) -> bool:
+        return True
 
 
 _THROTTLE_ERR = None
 _disable_power_throttling()  # apply to self ASAP, before heavy imports run
 
 # Global hotkeys — registered on the OS hook, so they fire from any app.
+# Windows only: Wayland has no global key hook for ordinary apps, so on Linux
+# the same three actions arrive as signals (see friday_ctl.py), which a desktop
+# shortcut can be bound to.
 KILL_HOTKEY = "ctrl+alt+shift+q"      # Hard kill: tear down and exit.
 RESTART_HOTKEY = "ctrl+alt+shift+r"   # Kill + relaunch (picks up code edits).
 PTT_HOTKEY = "ctrl+alt+space"         # Force-activate a session — bypasses
                                        # wake word & speaker check. For noisy
                                        # rooms or when you want guaranteed activation.
 
-# Path to the silent .vbs wrapper used by the restart hotkey.
-SILENT_LAUNCHER = Path(__file__).parent / "start_friday.vbs"
+# Path to the silent wrapper used by the restart hotkey.
+SILENT_LAUNCHER = Path(__file__).parent / (
+    "start_friday.vbs" if _WIN else "start_friday.sh"
+)
+# Where the running launcher records its PID so friday_ctl.py can signal it.
+PID_FILE = Path(__file__).parent / "runtime" / "friday.pid"
+# Unix socket for typed requests and status (friday_ctl ask, KRunner).
+CONTROL_SOCKET = Path(__file__).parent / "runtime" / "friday.sock"
 
 load_dotenv()
 
@@ -209,6 +231,25 @@ BOOT_TIMEOUT = 120.0
 BOOT_ATTEMPTS = 3
 
 
+# Linux control signals → the friday_ctl subcommand that sends each one.
+# SIGUSR1 is deliberately unused: the audio stack (PipeWire's ALSA/JACK client)
+# leaves it blocked in the main thread, so it would never be delivered.
+_CTL_COMMANDS = {
+    getattr(signal, "SIGTERM", None): "kill",
+    getattr(signal, "SIGHUP", None): "restart",
+    getattr(signal, "SIGUSR2", None): "ptt",
+}
+
+
+def _clear_pid_file() -> None:
+    """Remove the PID file — unless a relaunched instance already owns it."""
+    try:
+        if PID_FILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            PID_FILE.unlink()
+    except OSError:
+        pass
+
+
 class State(Enum):
     SLEEPING = "sleeping"
     ACTIVE = "active"
@@ -252,10 +293,22 @@ class WakeWordListener:
         from openwakeword.model import Model as WakeWordModel
 
         # Use onnx instead of tflite — tflite-runtime has no Windows wheels.
-        self._model = WakeWordModel(
-            wakeword_models=[model_name],
-            inference_framework="onnx",
-        )
+        def _load():
+            return WakeWordModel(
+                wakeword_models=[model_name],
+                inference_framework="onnx",
+            )
+
+        try:
+            self._model = _load()
+        except Exception as e:
+            # A fresh install has no model files: openwakeword ships without
+            # them and fetches them on demand.
+            logger.warning("Wake-word model unavailable (%s) — downloading…",
+                           type(e).__name__)
+            from openwakeword.utils import download_models
+            download_models()
+            self._model = _load()
         self._threshold = threshold
         self._audio = pyaudio.PyAudio()
         self._stream = None
@@ -435,7 +488,7 @@ def play_chime():
     """Play activation chime in a background thread."""
     def _play():
         try:
-            winsound.PlaySound(str(CHIME_PATH), winsound.SND_FILENAME | winsound.SND_ASYNC)
+            plat.play_wav(CHIME_PATH)
         except Exception as e:
             logger.warning("Could not play chime: %s", e)
     threading.Thread(target=_play, daemon=True).start()
@@ -449,6 +502,8 @@ def _ensure_boot_ack_clip() -> bool:
     """Create a cached local TTS clip for the wake acknowledgement if needed."""
     if BOOT_ACK_PATH.exists() and BOOT_ACK_PATH.stat().st_size > 0:
         return True
+    if not _WIN:
+        return False   # the clip is built with Windows' System.Speech
 
     BOOT_ACK_PATH.parent.mkdir(parents=True, exist_ok=True)
     script_lines = [
@@ -537,8 +592,7 @@ def _ensure_fastpath_ack_clip() -> bool:
 def play_fastpath_ack():
     """Play the fast-path confirmation tick (async, non-blocking)."""
     try:
-        winsound.PlaySound(str(FASTPATH_ACK_PATH),
-                           winsound.SND_FILENAME | winsound.SND_ASYNC)
+        plat.play_wav(FASTPATH_ACK_PATH)
     except Exception as e:
         logger.debug("Fast-path ack playback failed (non-fatal): %s", e)
 
@@ -550,7 +604,7 @@ def _run_fast_action(cmd) -> None:
     except Exception as e:
         logger.exception("fastpath action %s failed: %s", cmd.name, e)
         try:
-            winsound.MessageBeep(winsound.MB_ICONHAND)
+            plat.beep("error")
         except Exception:
             pass
 
@@ -584,6 +638,9 @@ class AgentProcess:
         self._on_listening = on_listening     # callback when mic is live again
         self._on_fatal = on_fatal             # callback on SESSION_FATAL (session died)
         self._on_idle = on_idle               # callback when a turn ends with nothing said
+        # Typed requests awaiting TEXT_REPLY, keyed by request id.
+        self._text_waiters: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Future]] = {}
+        self._text_seq = 0
 
     @property
     def alive(self) -> bool:
@@ -615,6 +672,7 @@ class AgentProcess:
             bufsize=1,
             encoding="utf-8",
             errors="replace",
+            **plat.popen_group_kwargs(),
         )
         logger.info("Agent subprocess started (PID %d) — cold-booting models…",
                      self._proc.pid)
@@ -624,6 +682,8 @@ class AgentProcess:
         # promptly under memory pressure (paged-out ONNX inference is what
         # produces the "VAD slower than realtime" warnings).
         try:
+            if not _WIN:
+                raise OSError("no EcoQoS on this platform")
             PROCESS_SET_INFORMATION = 0x0200
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             h = _kernel32.OpenProcess(
@@ -673,7 +733,11 @@ class AgentProcess:
             self._session_done.set()
 
     def _dispatch_line(self, stripped: str):
-        if "FRIDAY_READY" in stripped:
+        if stripped.startswith("TEXT_REPLY "):
+            # Checked first: the reply text is arbitrary and may itself contain
+            # words like "SPEAKING" that the substring matches below look for.
+            self._resolve_text_reply(stripped[len("TEXT_REPLY "):])
+        elif "FRIDAY_READY" in stripped:
             logger.info("Agent subprocess signalled FRIDAY_READY")
             self._ready.set()
         elif "SESSION_FATAL" in stripped:
@@ -707,6 +771,45 @@ class AgentProcess:
                 return
             # Log via the agent-tagged logger (goes to file + console).
             logging.getLogger("friday-agent").info(stripped)
+
+    def _resolve_text_reply(self, payload: str) -> None:
+        try:
+            reply = json.loads(payload)
+        except ValueError:
+            logger.warning("Malformed TEXT_REPLY from agent")
+            return
+        waiter = self._text_waiters.pop(str(reply.get("id")), None)
+        if waiter is None:
+            return
+        loop, future = waiter
+
+        def _finish():
+            if not future.done():
+                future.set_result(reply)
+
+        loop.call_soon_threadsafe(_finish)   # we're on the stdout reader thread
+
+    async def ask(self, text: str, timeout: float = TEXT_TURN_TIMEOUT + 5) -> dict:
+        """Send a typed request; returns {"text": ..., "error": ...}.
+
+        The agent answers through its normal session with audio output off, so
+        this is silent — it is how JARVIS is used in quiet mode.
+        """
+        loop = asyncio.get_running_loop()
+        self._text_seq += 1
+        request_id = f"t{self._text_seq}"
+        future: asyncio.Future = loop.create_future()
+        self._text_waiters[request_id] = (loop, future)
+        payload = json.dumps({"id": request_id, "text": text})
+        if not self._send(f"TEXT {payload}"):
+            self._text_waiters.pop(request_id, None)
+            return {"text": "", "error": "agent is not running"}
+        try:
+            return await asyncio.wait_for(future, timeout)
+        except asyncio.TimeoutError:
+            return {"text": "", "error": "timed out"}
+        finally:
+            self._text_waiters.pop(request_id, None)
 
     async def wait_ready(self, timeout: float = 60.0) -> bool:
         """Block until FRIDAY_READY (or timeout/death)."""
@@ -787,8 +890,8 @@ class AgentProcess:
         The agent spawns an MCP server (server.py) as a child, which may itself
         spawn task-executor grandchildren. subprocess.terminate() only kills the
         immediate process — descendants get reparented and become multi-GB
-        orphans that accumulate across restarts. Use taskkill /T /F to wipe
-        the whole tree for sure.
+        orphans that accumulate across restarts. plat.kill_tree (taskkill /T /F
+        on Windows, process-group kill on Linux) wipes the whole tree for sure.
         """
         if not self.alive:
             return
@@ -806,13 +909,9 @@ class AgentProcess:
         # Even after a graceful exit, MCP children sometimes outlive their
         # parent on Windows. Hard-kill the entire tree to be sure.
         try:
-            subprocess.run(
-                ["taskkill", "/T", "/F", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
+            plat.kill_tree(pid)
         except Exception as e:
-            logger.warning("taskkill /T failed for PID %d: %s", pid, e)
+            logger.warning("Tree kill failed for PID %d: %s", pid, e)
         logger.info("Agent subprocess stopped (tree killed)")
 
 
@@ -841,6 +940,16 @@ def _spawn_relaunch() -> bool:
         logger.error("Restart aborted — %s is missing; JARVIS stays up",
                      SILENT_LAUNCHER.name)
         return False
+    if not _WIN:
+        # A new session unlinks it from us, so it survives us dying.
+        subprocess.Popen(
+            [str(SILENT_LAUNCHER)],
+            cwd=str(SILENT_LAUNCHER.parent),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True,
+        )
+        return True
     # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP unlinks it from our job, so it
     # survives us dying.
     subprocess.Popen(
@@ -853,6 +962,35 @@ def _spawn_relaunch() -> bool:
         close_fds=True,
     )
     return True
+
+
+def _start_tray():
+    """Spawn the tray button (friday_tray.py). Cosmetic — failure is non-fatal."""
+    if _WIN or os.environ.get("FRIDAY_NO_TRAY") == "1":
+        return None
+    try:
+        return subprocess.Popen(
+            [sys.executable, str(Path(__file__).parent / "friday_tray.py")],
+            cwd=str(Path(__file__).parent),
+            stdin=subprocess.PIPE,          # closing it tells the tray to exit
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        logger.warning("Could not start tray button: %s", e)
+        return None
+
+
+def _stop_tray(tray) -> None:
+    if tray is None:
+        return
+    try:
+        tray.stdin.close()
+        tray.wait(timeout=2)
+    except Exception:
+        try:
+            tray.kill()
+        except Exception:
+            pass
 
 
 async def launcher_loop():
@@ -879,6 +1017,7 @@ async def launcher_loop():
     )
 
     overlay.start()
+    tray = _start_tray()
 
     # ---- Cold boot: spawn the agent FIRST ----------------------------------
     # Its ~20s boot is the long pole. Starting it before the launcher loads its
@@ -934,6 +1073,7 @@ async def launcher_loop():
             overlay.stop()
         except Exception:
             pass
+        _stop_tray(tray)
         try:
             wakeword.cleanup()
         except Exception:
@@ -945,6 +1085,7 @@ async def launcher_loop():
 
     def _kill_switch():
         logger.warning("KILL SWITCH pressed (%s) — shutting down NOW", KILL_HOTKEY)
+        _clear_pid_file()
         _teardown()
         # Hard-exit — skip asyncio teardown so nothing can hang.
         os._exit(0)
@@ -959,21 +1100,30 @@ async def launcher_loop():
         except Exception as e:
             logger.error("Restart spawn failed: %s", e)
             return
+        _clear_pid_file()
         _teardown()
         os._exit(0)
 
-    try:
-        keyboard.add_hotkey(KILL_HOTKEY, _kill_switch)
-        logger.info("Kill switch armed → press %s to terminate JARVIS", KILL_HOTKEY)
-    except Exception as e:
-        logger.warning("Could not register kill-switch hotkey: %s", e)
+    def _arm(hotkey, sig, handler, label):
+        """Bind one control action: a global hotkey on Windows, a signal on
+        Linux (sent by `friday_ctl`, which a desktop shortcut can run)."""
+        try:
+            if _WIN:
+                keyboard.add_hotkey(hotkey, handler)
+                logger.info("%s armed → press %s", label, hotkey)
+            else:
+                asyncio.get_running_loop().add_signal_handler(sig, handler)
+                logger.info("%s armed → run `friday_ctl %s`", label,
+                            _CTL_COMMANDS[sig])
+        except Exception as e:
+            logger.warning("Could not arm %s: %s", label, e)
 
-    try:
-        keyboard.add_hotkey(RESTART_HOTKEY, _restart_switch)
-        logger.info("Restart armed → press %s to reload JARVIS with new code",
-                    RESTART_HOTKEY)
-    except Exception as e:
-        logger.warning("Could not register restart hotkey: %s", e)
+    if not _WIN:
+        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
+
+    _arm(KILL_HOTKEY, getattr(signal, "SIGTERM", None), _kill_switch, "Kill switch")
+    _arm(RESTART_HOTKEY, getattr(signal, "SIGHUP", None), _restart_switch, "Restart")
 
     # ---- Push-to-talk activation -----------------------------------------
     # The SLEEPING loop checks this event every wake-word tick (~80ms), so
@@ -988,16 +1138,61 @@ async def launcher_loop():
         if state == State.ACTIVE:
             logger.info("PTT pressed (%s) — interrupting active turn", PTT_HOTKEY)
             agent.send_interrupt()
+        elif quiet.is_quiet():
+            # A key can be bumped in class; only an explicit "quiet off" lets
+            # JARVIS speak there.
+            logger.info("PTT ignored — quiet mode")
+            plat.notify("JARVIS is in quiet mode",
+                        "Type to me instead, or run: friday_ctl quiet off")
         else:
             logger.info("PTT pressed (%s) — wake", PTT_HOTKEY)
             ptt_event.set()
 
-    try:
-        keyboard.add_hotkey(PTT_HOTKEY, _ptt_pressed)
-        logger.info("Push-to-talk armed → press %s to activate without wake word",
-                    PTT_HOTKEY)
-    except Exception as e:
-        logger.warning("Could not register PTT hotkey: %s", e)
+    _arm(PTT_HOTKEY, getattr(signal, "SIGUSR2", None), _ptt_pressed, "Push-to-talk")
+
+    # ---- Control socket: typed requests + status ---------------------------
+    # One JSON object per line in, one per line out. Serves `friday_ctl ask`
+    # and the KRunner plugin; unlike the signals above it can carry a payload
+    # and an answer.
+    async def _handle_control(reader, writer):
+        try:
+            request = json.loads((await reader.readline()).decode("utf-8") or "{}")
+            command = request.get("cmd")
+            if command == "ask":
+                text = str(request.get("text", "")).strip()
+                logger.info("Typed request (%d chars)", len(text))
+                response = await agent.ask(text) if text else {
+                    "text": "", "error": "empty request"}
+                # The agent's PROCESSING/SPEAKING lines drove the overlay as if
+                # this were a voice turn; put it away again unless one is live.
+                if state != State.ACTIVE:
+                    overlay.hide()
+            elif command == "status":
+                # Polled every couple of seconds by the tray: cached SSID.
+                response = {"state": state.value, "agent_alive": agent.alive,
+                            **quiet.status(fresh=False)}
+            else:
+                response = {"error": f"unknown command: {command!r}"}
+        except Exception as e:
+            response = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            writer.write((json.dumps(response) + "\n").encode("utf-8"))
+            await writer.drain()
+        finally:
+            writer.close()
+
+    control_server = None
+    state = State.SLEEPING   # read by the control socket before the loop starts
+    if not _WIN:
+        try:
+            CONTROL_SOCKET.parent.mkdir(parents=True, exist_ok=True)
+            CONTROL_SOCKET.unlink(missing_ok=True)
+            control_server = await asyncio.start_unix_server(
+                _handle_control, path=str(CONTROL_SOCKET))
+            os.chmod(CONTROL_SOCKET, 0o600)
+            logger.info("Control socket listening → friday_ctl ask \"…\"")
+        except Exception as e:
+            logger.warning("Could not open control socket: %s", e)
 
     # ---- Wait for the agent boot started at the top of this function ----
     if not await boot_task:
@@ -1008,6 +1203,35 @@ async def launcher_loop():
     overlay.hide()           # hide the initial boot overlay
     logger.info("Agent subprocess ready — models loaded")
 
+    # ---- Cross-OS handoff: tasks the other OS left for this one -------------
+    # Off the wake path: the queue is a network call, and the laptop may have
+    # only just joined Wi-Fi. Each task runs as a silent typed request.
+    async def _run_handoff_tasks():
+        loop = asyncio.get_running_loop()
+        try:
+            tasks = await loop.run_in_executor(None, handoff.claim_pending)
+        except Exception as e:
+            logger.info("Handoff check skipped: %s", e)
+            return
+        queue = handoff.get_queue()
+        for task in tasks:
+            logger.info("Handoff from %s: %r", task.created_on, task.request)
+            plat.notify(f"Picking up from {task.created_on.capitalize()}", task.request)
+            reply = await agent.ask(task.request)
+            failed = bool(reply.get("error")) and not reply.get("text")
+            outcome = reply.get("error") if failed else (reply.get("text") or "done")
+            try:
+                await loop.run_in_executor(
+                    None, queue.finish, task,
+                    "failed" if failed else "done", str(outcome))
+            except Exception as e:
+                logger.warning("Could not mark handoff task done: %s", e)
+            logger.info("Handoff %s: %s", "failed" if failed else "done", outcome)
+            if state != State.ACTIVE:
+                overlay.hide()
+
+    handoff_task = asyncio.create_task(_run_handoff_tasks())   # noqa: F841
+
     wakeword.start_stream()
     state = State.SLEEPING
     recovery_started = False  # set when START_RECOVERED was already sent post-respawn
@@ -1015,6 +1239,8 @@ async def launcher_loop():
     respawn_failures = 0      # consecutive failed respawns → backoff
     ready_at = time.monotonic()  # when the current agent reported FRIDAY_READY
     logger.info("JARVIS launcher ready — say 'Hey Jarvis' to activate")
+    if quiet.is_quiet():
+        logger.info("Quiet mode is ON (%s) — text only", quiet.status()["reason"])
 
     try:
         while True:
@@ -1042,6 +1268,8 @@ async def launcher_loop():
                     # If the death was a fatal session close (SESSION_FATAL),
                     # come back speaking — re-activate with the recovery line
                     # instead of waiting silently for the next wake word.
+                    if pending_recovery_cue.is_set() and quiet.is_quiet():
+                        pending_recovery_cue.clear()   # recover silently
                     if pending_recovery_cue.is_set():
                         pending_recovery_cue.clear()
                         logger.info("Recovering from fatal close — re-activating with recovery line")
@@ -1079,6 +1307,14 @@ async def launcher_loop():
                     if _is_near_silent(wav):
                         logger.info("Wake word ignored — mic buffer is silent "
                                     "(false trigger)")
+                        wakeword.reset()
+                        continue
+
+                    # Quiet mode (school Wi-Fi or manual): never speak. Checked
+                    # after the silence test so real wake words are what gets
+                    # logged, and before anything visible or audible happens.
+                    if quiet.is_quiet():
+                        logger.info("Wake word ignored — quiet mode")
                         wakeword.reset()
                         continue
 
@@ -1161,6 +1397,8 @@ async def launcher_loop():
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:
+        _clear_pid_file()
+        _stop_tray(tray)
         overlay.stop()
         wakeword.cleanup()
         agent.stop()

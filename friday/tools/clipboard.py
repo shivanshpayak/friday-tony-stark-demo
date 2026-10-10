@@ -1,12 +1,19 @@
 """
-Clipboard tools — read from and write to the Windows clipboard via ctypes.
+Clipboard tools — read from and write to the system clipboard.
+
+Windows goes through the Win32 API via ctypes; Linux through wl-clipboard or
+Klipper (see friday/plat.py).
 """
 
 import ctypes
-import ctypes.wintypes
 
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
+from friday import plat
+
+if plat.IS_WINDOWS:
+    import ctypes.wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
 
 # Windows clipboard format for Unicode text
 CF_UNICODETEXT = 13
@@ -31,6 +38,14 @@ def register(mcp):
         Use this when the user asks: "What's in my clipboard?",
         "Read my clipboard", or "What did I copy?".
         """
+        if not plat.IS_WINDOWS:
+            text = plat.clipboard_get()
+            if text is None:
+                return "I couldn't access the clipboard on this system, sir."
+            if not text.strip():
+                return "The clipboard is empty, sir."
+            return text
+
         if not _open_clipboard():
             return "I couldn't access the clipboard — another application may be holding it. Please try again in a moment, sir."
 
@@ -72,6 +87,12 @@ def register(mcp):
         if not text:
             return "Nothing to copy — no text was provided, sir."
 
+        preview = text if len(text) <= 60 else text[:57] + "..."
+        if not plat.IS_WINDOWS:
+            if not plat.clipboard_set(text):
+                return "I was unable to write to the clipboard, sir."
+            return f"Copied to clipboard: \"{preview}\""
+
         if not _open_clipboard():
             return "I couldn't access the clipboard — another application may be holding it. Please try again in a moment, sir."
 
@@ -106,5 +127,4 @@ def register(mcp):
             user32.CloseClipboard()
 
         # Provide a brief preview so the user knows what was copied
-        preview = text if len(text) <= 60 else text[:57] + "..."
         return f"Copied to clipboard: \"{preview}\""

@@ -1,7 +1,8 @@
 """Messaging smart-gateway tool."""
-import os
 import urllib.parse
 from mcp.server.fastmcp import FastMCP
+
+from friday import plat
 
 def register(mcp: FastMCP):
     
@@ -19,21 +20,24 @@ def register(mcp: FastMCP):
             escaped_text = urllib.parse.quote(text)
             uri = f"whatsapp://send?text={escaped_text}"
             try:
-                os.startfile(uri)
+                plat.open_target(uri)
                 return f"Opened WhatsApp with your drafted message to {recipient}. Just hit send."
             except Exception as e:
                 return f"Failed to open WhatsApp locally: {e}"
                 
         elif "discord" in platform:
-            # Discord has no send-URI. We copy to clipboard using powershell and focus Discord.
-            escaped_text = text.replace("'", "''")
+            # Discord has no send-URI. We copy to clipboard and focus Discord.
             import subprocess
             try:
-                subprocess.run(["powershell", "-command", f"Set-Clipboard -Value '{escaped_text}'"], capture_output=True)
+                if plat.IS_WINDOWS:
+                    escaped_text = text.replace("'", "''")
+                    subprocess.run(["powershell", "-command", f"Set-Clipboard -Value '{escaped_text}'"], capture_output=True)
+                elif not plat.clipboard_set(text):
+                    return "I couldn't reach the clipboard to stage that message, sir."
                 
                 # Try to launch/focus Discord using our apps cache or raw URI path
                 # Since Discord registers discord://, we can ping it to bring window up.
-                os.startfile("discord://")
+                plat.open_target("discord://")
                 return f"I copied the message to your clipboard and opened Discord. Just paste it to {recipient}!"
             except Exception as e:
                 return f"Failed to draft message to Discord: {e}"

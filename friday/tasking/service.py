@@ -2,6 +2,7 @@
 import asyncio
 import logging
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 
 from .models import TaskRecord
@@ -96,8 +97,15 @@ def start_task(goal: str, source: str = "voice") -> str:
     # Launch a detached visible terminal window running the standalone executor.
     import os
     import sys
-    cmd = f'start cmd /k "{sys.executable} -m friday.tasking.standalone_executor {task_id}"'
-    os.system(cmd)
+    from friday import plat
+    if plat.IS_WINDOWS:
+        cmd = f'start cmd /k "{sys.executable} -m friday.tasking.standalone_executor {task_id}"'
+        os.system(cmd)
+    else:
+        plat.open_terminal(
+            [sys.executable, "-m", "friday.tasking.standalone_executor", task_id],
+            cwd=str(Path(__file__).resolve().parents[2]),
+        )
 
     return task_id
 

@@ -7,9 +7,9 @@ import logging
 import re
 
 import httpx
-from PIL import ImageGrab
 from mcp.server.fastmcp import FastMCP
 
+from friday import plat
 from friday.screen_scroll import capture_scrolling
 
 logger = logging.getLogger("friday-agent")
@@ -117,7 +117,7 @@ def _analyze_images(images: list, instruction: str) -> str:
 
 def _capture_and_analyze(prompt: str) -> str:
     try:
-        img = ImageGrab.grab(all_screens=True)
+        img = plat.grab_screen()
     except Exception as e:
         return f"Screen capture failed: {e}"
 
@@ -138,6 +138,24 @@ def _active_window_center():
     if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         raise OSError("GetWindowRect failed")
     return ((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2)
+
+
+def _linux_scroll_fn():
+    """Wheel-scroll at the pointer. Wayland only lets a uinput tool (ydotool)
+    inject input; pyautogui reaches X11/XWayland windows and nothing else."""
+    import shutil
+    import subprocess
+    if shutil.which("ydotool"):
+        def scroll():
+            subprocess.run(
+                ["ydotool", "mousemove", "--wheel", "--", "0", str(-SCROLL_CLICKS)],
+                capture_output=True, timeout=5, check=True,
+            )
+        return scroll
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland":
+        return None
+    import pyautogui
+    return lambda: pyautogui.scroll(-SCROLL_CLICKS)
 
 
 def _make_scroll_fn(pyautogui):
@@ -164,13 +182,20 @@ def _build_scroll_instruction(prompt: str) -> str:
 
 def _capture_scrolling_and_analyze(prompt: str) -> str:
     try:
-        import pyautogui
+        if plat.IS_WINDOWS:
+            import pyautogui
+            scroll_fn = _make_scroll_fn(pyautogui)
+        else:
+            scroll_fn = _linux_scroll_fn()
     except Exception:
         return "I need the pyautogui component to read scrolling content, sir."
+    if scroll_fn is None:
+        return ("I can't scroll windows on this Wayland session without ydotool, "
+                "sir. I can still read what's currently on screen.")
     try:
         frames = capture_scrolling(
-            grab_fn=lambda: ImageGrab.grab(all_screens=True),
-            scroll_fn=_make_scroll_fn(pyautogui),
+            grab_fn=plat.grab_screen,
+            scroll_fn=scroll_fn,
         )
     except Exception as e:
         return f"Screen capture failed: {e}"

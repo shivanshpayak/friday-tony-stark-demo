@@ -1,67 +1,131 @@
 """
 JARVIS Voice Enrollment
 =======================
-Records a short sample of the user's voice and saves a speaker embedding
-that the wake-word gate uses to reject non-user voices (TV, other people).
+Builds the speaker fingerprint the wake-word gate uses to reject other voices
+(TV, other people).
 
 Usage:
-    .venv/Scripts/python.exe enroll_voice.py
+    uv run python enroll_voice.py
 
-The script will:
-  1. Prompt you to speak for ~20 seconds (keep talking naturally).
-  2. Compute a Resemblyzer embedding from the clip.
-  3. Save it to voice_embedding.npy next to this file.
+You say "Hey Jarvis" a handful of times. Each time the wake word fires, the
+script keeps exactly what the launcher would verify — the last 2.5 seconds of
+mic audio — and the fingerprint is the average of those clips.
+
+Why not just record 20 seconds of talking (the old approach): the gate never
+sees 20 seconds of talking. It sees one short "Hey Jarvis" padded with room
+noise, and a fingerprint made from long natural speech matched that only
+marginally (accepted wakes averaged 0.74 against a 0.70 threshold, and about a
+third were rejected). Enrolling on the same kind of clip closes that gap.
+
+A running JARVIS is stopped first (it would answer every "Hey Jarvis") and
+started again at the end with the new fingerprint.
 """
 
+import os
+import shutil
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import pyaudio
-from resemblyzer import VoiceEncoder
 
-SAMPLE_RATE = 16000
-CHUNK = 1600  # 100ms
-RECORD_SECONDS = 20
-OUTPUT_PATH = Path(__file__).parent / "voice_embedding.npy"
-PROMPTS = [
-    "Hey Jarvis, run a diagnostic and tell me how the systems are looking.",
-    "Jarvis, give me a brief on the world right now, sir.",
-    "Open the world monitor and show me what I'm looking at.",
-    "Stand down for now, I'll call you back in a minute.",
-    "Talk naturally about what you did today for the rest of the time.",
+ROOT = Path(__file__).parent
+OUTPUT_PATH = ROOT / "voice_embedding.npy"
+BACKUP_PATH = ROOT / "voice_embedding.previous.npy"
+PID_FILE = ROOT / "runtime" / "friday.pid"
+
+# These mirror friday_launcher.py — the clips must be captured the way the
+# launcher captures them, or the enrollment stops matching what it verifies.
+WAKE_MODEL = "hey_jarvis_v0.1"
+WAKE_THRESHOLD = 0.7
+AUDIO_RATE = 16000
+AUDIO_CHUNK = 1280
+SPEAKER_BUFFER_SECONDS = 2.5
+SPEAKER_SIM_THRESHOLD = 0.70
+
+SAMPLES = 10
+SAMPLE_TIMEOUT = 25.0     # seconds to wait for one "Hey Jarvis"
+SETTLE_SECONDS = 1.0      # pause between samples
+# How to say each one, so the fingerprint covers how you actually call it.
+STYLES = [
+    "normally", "normally", "normally", "a little quieter", "a little louder",
+    "leaning back from the laptop", "normally", "quickly", "slowly", "normally",
 ]
 
 
-def record_clip(seconds: int) -> np.ndarray:
+def _stop_running_jarvis() -> bool:
+    try:
+        pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+        os.kill(pid, signal.SIGTERM)
+    except (OSError, ValueError):
+        return False
+    for _ in range(40):
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            break
+        time.sleep(0.25)
+    time.sleep(1.0)   # let it release the mic
+    return True
+
+
+def _restart_jarvis() -> None:
+    script = ROOT / "start_friday.sh"
+    if not script.exists():
+        return
+    subprocess.Popen([str(script)], cwd=str(ROOT), stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def _capture_wake_clips(count: int) -> list[np.ndarray]:
+    """Collect `count` clips, each the 2.5s of audio behind a wake-word hit."""
+    from openwakeword.model import Model as WakeWordModel
+
+    model = WakeWordModel(wakeword_models=[WAKE_MODEL], inference_framework="onnx")
     pa = pyaudio.PyAudio()
-    stream = pa.open(
-        format=pyaudio.paInt16,
-        channels=1,
-        rate=SAMPLE_RATE,
-        input=True,
-        frames_per_buffer=CHUNK,
-    )
-    total_chunks = int(seconds * SAMPLE_RATE / CHUNK)
-    frames = []
-    start = time.time()
-    print()
-    for i in range(total_chunks):
-        raw = stream.read(CHUNK, exception_on_overflow=False)
-        frames.append(np.frombuffer(raw, dtype=np.int16))
-        elapsed = time.time() - start
-        remaining = max(0, seconds - elapsed)
-        bar_len = 30
-        filled = int(bar_len * (i + 1) / total_chunks)
-        bar = "#" * filled + "-" * (bar_len - filled)
-        sys.stdout.write(f"\r  recording [{bar}] {remaining:4.1f}s left ")
-        sys.stdout.flush()
-    print()
-    stream.stop_stream()
-    stream.close()
-    pa.terminate()
-    return np.concatenate(frames).astype(np.float32) / 32768.0
+    stream = pa.open(format=pyaudio.paInt16, channels=1, rate=AUDIO_RATE,
+                     input=True, frames_per_buffer=AUDIO_CHUNK)
+    ring = np.zeros(int(AUDIO_RATE * SPEAKER_BUFFER_SECONDS), dtype=np.int16)
+    clips: list[np.ndarray] = []
+    try:
+        while len(clips) < count:
+            style = STYLES[len(clips) % len(STYLES)]
+            print(f"  [{len(clips) + 1}/{count}] Say \"Hey Jarvis\" {style}… ",
+                  end="", flush=True)
+            model.reset()
+            ring[:] = 0
+            deadline = time.monotonic() + SAMPLE_TIMEOUT
+            heard = False
+            while time.monotonic() < deadline:
+                audio = np.frombuffer(
+                    stream.read(AUDIO_CHUNK, exception_on_overflow=False),
+                    dtype=np.int16)
+                ring = np.concatenate((ring[len(audio):], audio))
+                score = max(model.predict(audio).values())
+                if score >= WAKE_THRESHOLD:
+                    clips.append(ring.astype(np.float32) / 32768.0)
+                    print(f"got it (wake score {score:.2f})")
+                    heard = True
+                    break
+            if not heard:
+                print("didn't catch that — try again, a bit closer to the mic.")
+                continue
+            # Drain the tail of the word so it can't bleed into the next clip.
+            for _ in range(int(SETTLE_SECONDS * AUDIO_RATE / AUDIO_CHUNK)):
+                stream.read(AUDIO_CHUNK, exception_on_overflow=False)
+    finally:
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+    return clips
+
+
+def _unit(vector: np.ndarray) -> np.ndarray:
+    return vector / (np.linalg.norm(vector) + 1e-9)
 
 
 def main():
@@ -69,35 +133,56 @@ def main():
     print("JARVIS Voice Enrollment")
     print("=" * 60)
     print()
-    print("I'll record ~%d seconds of your voice to build a speaker" % RECORD_SECONDS)
-    print("fingerprint. Speak naturally. Here are some prompts you can use:")
+    print(f"You'll say \"Hey Jarvis\" {SAMPLES} times. Wait for each prompt,")
+    print("and sit where you normally sit when you talk to it.")
     print()
-    for line in PROMPTS:
-        print(f"  - {line}")
+    input("Press ENTER when you're ready...")
     print()
-    input("Press ENTER when you're ready, then start talking...")
 
-    wav = record_clip(RECORD_SECONDS)
+    was_running = _stop_running_jarvis()
+    if was_running:
+        print("  (stopped the running JARVIS so it doesn't answer)")
+    print("  loading the wake-word model...")
+    print()
 
-    # Basic sanity check: is the clip loud enough?
-    rms = float(np.sqrt(np.mean(wav ** 2)))
-    print(f"  signal RMS: {rms:.4f}")
-    if rms < 0.005:
+    try:
+        clips = _capture_wake_clips(SAMPLES)
+
         print()
-        print("  WARNING: clip is very quiet. Check your mic and try again.")
-        sys.exit(1)
+        print("  computing voice fingerprint...")
+        from resemblyzer import VoiceEncoder
+        encoder = VoiceEncoder(verbose=False)
+        embeddings = [_unit(encoder.embed_utterance(clip)) for clip in clips]
+        fingerprint = _unit(np.mean(embeddings, axis=0))
 
-    print()
-    print("  computing voice embedding...")
-    encoder = VoiceEncoder()
-    embedding = encoder.embed_utterance(wav)
-    print(f"  embedding shape: {embedding.shape}")
+        # Honest self-check: score each clip against a fingerprint built from
+        # the OTHER clips, so a sample can't vouch for itself.
+        held_out = []
+        for i, emb in enumerate(embeddings):
+            others = _unit(np.mean(embeddings[:i] + embeddings[i + 1:], axis=0))
+            held_out.append(float(np.dot(emb, others)))
+        low, mean = min(held_out), sum(held_out) / len(held_out)
+        passed = sum(score >= SPEAKER_SIM_THRESHOLD for score in held_out)
 
-    np.save(OUTPUT_PATH, embedding)
+        if OUTPUT_PATH.exists():
+            shutil.copy2(OUTPUT_PATH, BACKUP_PATH)
+        np.save(OUTPUT_PATH, fingerprint.astype(np.float32))
+
+        print()
+        print(f"  saved -> {OUTPUT_PATH.name}  (previous kept as {BACKUP_PATH.name})")
+        print(f"  match scores: lowest {low:.2f}, average {mean:.2f} "
+              f"(JARVIS accepts {SPEAKER_SIM_THRESHOLD:.2f} and up)")
+        print(f"  {passed} of {len(held_out)} samples would have been accepted.")
+        if passed < len(held_out):
+            print("  Some were below the bar — run this again in a quieter moment"
+                  " if JARVIS still ignores you.")
+    finally:
+        if was_running:
+            print()
+            print("  restarting JARVIS with the new fingerprint...")
+            _restart_jarvis()
     print()
-    print(f"  saved -> {OUTPUT_PATH}")
-    print()
-    print("Done. Run 'uv run friday_start' and only your voice should wake it.")
+    print("Done.")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,8 @@
 """
-Install/uninstall JARVIS as a Windows startup task.
+Install/uninstall JARVIS as a login startup item.
+
+Windows: a Task Scheduler "at logon" task.
+Linux:   an XDG autostart entry (~/.config/autostart/jarvis.desktop).
 
 Usage:
     python install_startup.py install
@@ -17,7 +20,37 @@ PYTHON_EXE = Path(sys.executable).parent / "pythonw.exe"
 UV_MODULE = "uv"
 
 
+AUTOSTART_FILE = Path.home() / ".config" / "autostart" / "jarvis.desktop"
+
+
+def _install_linux():
+    script = PROJECT_DIR / "start_friday.sh"
+    AUTOSTART_FILE.parent.mkdir(parents=True, exist_ok=True)
+    AUTOSTART_FILE.write_text(
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={TASK_NAME}\n"
+        f'Exec="{script}"\n'
+        f"Path={PROJECT_DIR}\n"
+        "Terminal=false\n"
+        "X-KDE-autostart-after=panel\n",
+        encoding="utf-8",
+    )
+    print(f"Installed '{TASK_NAME}' to run at login.")
+    print(f"  Entry: {AUTOSTART_FILE}")
+
+
+def _uninstall_linux():
+    if AUTOSTART_FILE.exists():
+        AUTOSTART_FILE.unlink()
+        print(f"Removed '{TASK_NAME}' from startup.")
+    else:
+        print(f"'{TASK_NAME}' was not installed.")
+
+
 def install():
+    if sys.platform != "win32":
+        return _install_linux()
     command = f'"{PYTHON_EXE}" -m {UV_MODULE} run friday_start'
     result = subprocess.run(
         [
@@ -42,6 +75,8 @@ def install():
 
 
 def uninstall():
+    if sys.platform != "win32":
+        return _uninstall_linux()
     result = subprocess.run(
         ["schtasks", "/delete", "/tn", TASK_NAME, "/f"],
         capture_output=True,

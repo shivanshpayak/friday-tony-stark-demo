@@ -8,6 +8,7 @@ from pathlib import Path
 
 from livekit.agents import llm
 from livekit.agents.llm.mcp import MCPServerStdio, MCPToolset
+from friday import plat
 from friday.providers import build_llm
 from friday.tasking.store import load_task, save_task
 
@@ -33,6 +34,7 @@ async def execute_in_terminal(task_id: str):
     mcp_server = MCPServerStdio(
         command=sys.executable,
         args=[str(_REPO_ROOT / "server.py")],
+        env=plat.tool_server_env(),
         cwd=str(_REPO_ROOT),
     )
     
