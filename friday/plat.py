@@ -21,6 +21,8 @@ IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
 
 _DEVNULL = subprocess.DEVNULL
+# Windows: keep console programs we spawn from flashing a window. 0 elsewhere.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 # --- voice fingerprint -----------------------------------------------------
@@ -41,7 +43,7 @@ def _detached(argv: list[str], cwd: str | None = None) -> subprocess.Popen:
     """Spawn a process that outlives us and never touches our stdio."""
     return subprocess.Popen(
         argv, cwd=cwd, stdin=_DEVNULL, stdout=_DEVNULL, stderr=_DEVNULL,
-        start_new_session=True, close_fds=True,
+        start_new_session=True, close_fds=True, creationflags=_NO_WINDOW,
     )
 
 
@@ -98,8 +100,10 @@ def beep(kind: str = "info") -> None:
 
 # --- rebooting into the other OS -------------------------------------------
 
-# Root-owned helper that makes Windows the next boot only (GRUB one-shot); the
-# user's sudoers lets it run without a password. See ~/boot-switch.
+# Root-owned helper that makes Windows the next boot only (UEFI one-shot — not
+# through GRUB, or BitLocker asks for the recovery key); the user's sudoers
+# lets it run without a password. Its source is boot-switch/boot-windows-next,
+# put in place by install_boot_switch.py; the sudoers rule is in ~/boot-switch.
 _BOOT_WINDOWS_HELPER = "/usr/local/sbin/boot-windows-next"
 
 
@@ -129,6 +133,55 @@ def restart_into_windows(delay: float = 6.0) -> None:
         "qdbus6 org.kde.Shutdown /Shutdown org.kde.Shutdown.logoutAndReboot"
     )
     _detached(["sh", "-c", script])
+
+
+# The Windows counterpart of the helper above: a Task Scheduler task that runs
+# elevated, makes Linux the next boot only (UEFI one-shot) and restarts. Running
+# it needs no UAC prompt. Registered once by install_boot_switch.py.
+BOOT_LINUX_TASK = "JARVIS Restart into Linux"
+
+_WAIT_THEN_RUN = ("import subprocess, sys, time; "
+                  "time.sleep(float(sys.argv[1])); subprocess.run(sys.argv[2:])")
+
+
+def _run_later(delay: float, argv: list[str]) -> None:
+    """Run `argv` after `delay` seconds, in a process that outlives us."""
+    _detached([sys.executable, "-c", _WAIT_THEN_RUN, str(delay), *argv])
+
+
+def can_restart_into_linux() -> str | None:
+    """None if a reboot into Linux can be triggered, else why not."""
+    if not IS_WINDOWS:
+        return "already on Linux"
+    registered = subprocess.run(["schtasks", "/query", "/tn", BOOT_LINUX_TASK],
+                                capture_output=True, timeout=5,
+                                creationflags=_NO_WINDOW)
+    if registered.returncode != 0:
+        return "the boot-switch helper isn't installed"
+    return None
+
+
+def restart_into_linux(delay: float = 6.0) -> None:
+    """Reboot into Linux after `delay` seconds (time for a spoken line).
+
+    The task restarts without forcing, so apps with unsaved work get to ask
+    before the session ends. Detached: it must outlive the tool server.
+    """
+    _run_later(delay, ["schtasks", "/run", "/tn", BOOT_LINUX_TASK])
+
+
+def can_restart_into(os_name: str) -> str | None:
+    """None if a reboot into `os_name` can be triggered, else why not."""
+    if os_name == "windows":
+        return can_restart_into_windows()
+    if os_name == "linux":
+        return can_restart_into_linux()
+    return f"I don't know how to boot {os_name}"
+
+
+def restart_into(os_name: str, delay: float = 6.0) -> None:
+    """Reboot into `os_name` — check can_restart_into() first."""
+    (restart_into_windows if os_name == "windows" else restart_into_linux)(delay)
 
 
 # --- desktop notifications -------------------------------------------------

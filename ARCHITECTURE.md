@@ -292,6 +292,7 @@ selected at import time — nothing on the latency path changed.
 | PTT / restart / kill | global hotkeys (`keyboard`) | signals SIGUSR2 / SIGHUP / SIGTERM (not SIGUSR1 — the PipeWire client blocks it) via `friday_ctl` + `runtime/friday.pid` | `friday_launcher.py`, `friday_ctl.py` |
 | Overlay | Tk + Win32 layered windows | Qt subprocess `friday_overlay_qt.py`, fed state names over stdin | `friday_overlay.py` |
 | Autostart / relaunch | Task Scheduler, `start_friday.vbs` | `~/.config/autostart/jarvis.desktop`, `start_friday.sh` | `install_startup.py` |
+| Reboot into the other OS | elevated Task Scheduler task `JARVIS Restart into Linux` (UEFI one-shot via `bcdedit`, then restart) | root helper `boot-windows-next` (UEFI one-shot via `efibootmgr`) + KDE logout | `plat.restart_into`, `install_boot_switch.py`, `boot-switch/` |
 
 Linux gotchas:
 
@@ -367,8 +368,14 @@ already have; `FRIDAY_HANDOFF_DIR` swaps in a folder queue.
 
 ```
 Linux:   "FRC mode" ─> start_frc_mode ─> handoff.leave_task("FRC mode", windows)
-                                      └> plat.restart_into_windows()  (GRUB one-shot + KDE logout)
+                                      └> plat.restart_into_windows()  (firmware one-shot + KDE logout)
 Windows: launcher boots ─> agent ready ─> handoff.claim_pending() ─> agent.ask(task) ─> queue.finish(done)
+
+Windows: "switch to Linux [and …]" ─> leave_task_for_other_os ─> handoff.leave_task(…, linux)   (only if there is a task)
+                                                              └> plat.restart_into_linux() ─> schtasks /run "JARVIS Restart into Linux"
+         "Restart into Linux" shortcut (Desktop / Start menu) ────────────────────────────────┘
+         the task, elevated: bcdedit /enum firmware ─> find the Linux loader's entry
+                             ─> bcdedit /set {fwbootmgr} bootsequence <id> ─> shutdown /r /t 0
 ```
 
 - The note is saved BEFORE the reboot is scheduled, and the reboot is checked
@@ -378,7 +385,38 @@ Windows: launcher boots ─> agent ready ─> handoff.claim_pending() ─> agent
 - Pickup runs after `FRIDAY_READY` as a background task, through the silent
   typed-request path, so it never delays the wake word and respects quiet mode.
 - `leave_task_for_other_os` (friday/tools/handoff.py) is the general tool:
-  "next time I'm on Windows, …".
+  "next time I'm on Windows, …". With `restart_now` it also switches, in either
+  direction; a bare "switch to Linux" restarts without queuing an empty note.
+- **Windows → Linux** (`install_boot_switch.py install`, once): Windows can't
+  steer GRUB, so it asks the firmware to boot the Linux entry next, once. That
+  needs admin, hence a Task Scheduler task that runs elevated — the one UAC
+  prompt is at install time; the shortcut and JARVIS just run the task.
+  - The task's whole action is an inline PowerShell command with absolute
+    System32 paths: nothing a non-elevated process can edit runs elevated.
+  - The entry is found by its loader path (`\EFI\<distro>\shimx64.efi`) on every
+    click, not stored by id: Windows re-ids the entry when it is re-created.
+  - The restart happens only if the one-shot was set, and is not forced
+    (`/t 0`), so unsaved work still gets its prompt. Failure shows a dialog.
+  - Allowed on battery explicitly — Task Scheduler's default is to silently not
+    start a task there.
+  - This only guarantees GRUB loads next; which entry GRUB then picks is GRUB's
+    own default (Linux side: `GRUB_DEFAULT` / `GRUB_TIMEOUT`).
+  - Guarded by `tests/test_boot_switch.py`, which runs the task's real script
+    against stand-ins for `bcdedit` and `shutdown`.
+- **Linux → Windows goes through the firmware too, never through GRUB**
+  (`boot-switch/boot-windows-next`: `efibootmgr --bootnext <Windows Boot
+  Manager>`; `install_boot_switch.py install` on Linux puts it in
+  `/usr/local/sbin`). Windows is BitLocker-encrypted with the key sealed to the
+  TPM. A Windows that GRUB chain-loads has shim/GRUB in its measured boot chain
+  (PCR 7), the TPM refuses the key, and Windows asks for the 48-digit recovery
+  key — every time. Windows' own log says so: BitLocker-Driver 24635 "PCRs did
+  not match", BitLocker Management 881 "OS Loader Authority … not in the
+  verified certificate chain for the boot manager". Started by the firmware it
+  unlocks by itself. Same reason not to pick "Windows" in the GRUB menu by hand.
+- **GRUB's menu must time out into Linux** for the Windows → Linux switch to be
+  hands-free: the one-shot only gets as far as GRUB. That is `GRUB_TIMEOUT` (and
+  on Ubuntu `GRUB_RECORDFAIL_TIMEOUT`) in `/etc/default/grub`, then regenerate
+  `grub.cfg`.
 
 **FRC mode** (`start_frc_mode` in `friday/tools/frc.py`): on Windows it opens
 FRC VS Code, the Driver Station (which brings Elastic up) and AdvantageScope. On

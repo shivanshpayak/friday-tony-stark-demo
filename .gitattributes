@@ -1,0 +1,2 @@
+# Run by /bin/sh on Linux: CRLF line endings would break it.
+boot-switch/boot-windows-next text eol=lf

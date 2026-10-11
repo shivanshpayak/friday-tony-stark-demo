@@ -1,0 +1,18 @@
+#!/bin/sh
+# Make Windows the next boot only — started by the firmware, not by GRUB.
+#
+# A Windows that GRUB starts has GRUB in its measured boot chain, so the TPM
+# refuses to release the BitLocker key and Windows asks for the recovery key.
+# Started straight from the firmware, it unlocks by itself.
+#
+# Lives root-owned at /usr/local/sbin/boot-windows-next, where JARVIS runs it
+# with passwordless sudo (friday/plat.py). Put it there with:
+#     python install_boot_switch.py install
+set -eu
+
+entry=$(efibootmgr | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\}[[:space:]]*Windows Boot Manager.*/\1/p' | head -n 1)
+if [ -z "$entry" ]; then
+    echo "boot-windows-next: the firmware has no 'Windows Boot Manager' boot entry" >&2
+    exit 1
+fi
+exec efibootmgr --quiet --bootnext "$entry"
