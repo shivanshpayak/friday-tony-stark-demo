@@ -107,7 +107,9 @@ def build_stt(http_session=None, room_name=None):
         logger.info("STT → Deepgram")
         # Deepgram ends the user's turn (agent_friday._stt_ends_turns): 300 ms
         # of silence, so a breath mid-sentence doesn't cut the request short.
-        return lk_deepgram.STT(endpointing_ms=300)
+        # keyterm: "FRC mode" came back as "Foci mode" / "FOC mode" / "FIC mode"
+        # more often than not, and then no tool matched.
+        return lk_deepgram.STT(endpointing_ms=300, keyterm=["FRC", "FRC mode"])
     elif STT_PROVIDER == "groq":
         from livekit.plugins import openai as lk_openai
         logger.info("STT → Groq Whisper (turbo)")

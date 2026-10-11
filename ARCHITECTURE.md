@@ -334,6 +334,12 @@ Linux gotchas:
   mains hum on the charging laptop kept it "speaking" indefinitely, so a
   finished transcript never became a turn and JARVIS sat silent (typed
   requests still worked). Other STT providers keep the VAD.
+- **Mains hum is filtered out of the session mic** (`friday/mic_filter.py`, a
+  250 Hz high-pass applied to every frame in `stt_node`). Deepgram's endpointing
+  was fooled by the same 120 Hz tone: measured against the live API, it never
+  sent `speech_final` with the hum, and did once the hum was filtered. The
+  wake-word path is not filtered (the enrolled fingerprint was made unfiltered).
+  Deepgram also gets `keyterm=["FRC", "FRC mode"]` — it kept hearing "Foci mode".
 
 ## 6b. Quiet mode and typed requests
 
@@ -454,6 +460,32 @@ Windows: "switch to Linux [and …]" ─> leave_task_for_other_os ─> handoff.l
   it applies from the next restart — System log, Kernel-General event 25, then
   reads "RTC time is in UTC: true"). A JARVIS started under a wrong clock keeps
   its rejected sign-in for hours: after any clock correction, restart it.
+- **A voice switch to Linux logs in without the password, once.** The user was
+  just recognised by voice on Windows, so typing a password on arrival is the
+  only step left that needs hands.
+
+  ```
+  Windows: "switch to Linux" ─> plat.restart_into_linux ─> task "JARVIS Voice Switch to Linux"
+           (the plain task's steps) + write <EFI partition>\EFI\jarvis\autologin-once ─> restart
+  Linux:   jarvis-autologin-once.service (root, before the login screen)
+           pass there?  yes ─> delete it, write /etc/sddm.conf.d/90-jarvis-autologin.conf ─> SDDM logs in
+                        no  ─> delete that config ─> password screen
+  ```
+
+  - Two tasks on Windows: the "Restart into Linux" shortcut runs the plain one
+    and leaves no pass, so a switch by hand still ends at the password. JARVIS
+    runs the voice one when it is registered, else the plain one.
+  - The pass is on the EFI system partition because it is the only partition
+    both systems can read. It is written after the one-time boot is set (no
+    pass from a switch that failed) and never blocks the restart.
+  - Linux removes the autologin config on every boot before deciding, so one
+    pass is one login. A pass it cannot delete is ignored. Waking from sleep
+    is the lock screen, not SDDM — it still asks.
+  - It is a convenience, not a proof: anything that can write the EFI
+    partition (a Windows admin, a USB boot) can leave a pass. The Linux
+    partition is not encrypted, so that same access already reads every file.
+  - `install_boot_switch.py install` on each OS sets it up; `uninstall` on
+    Linux removes it. Guarded by `tests/test_boot_switch.py`.
 
 **FRC mode** (`start_frc_mode` in `friday/tools/frc.py`): on Windows it opens
 FRC VS Code, the Driver Station (which brings Elastic up) and AdvantageScope. On

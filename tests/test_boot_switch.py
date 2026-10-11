@@ -50,8 +50,21 @@ def test_restart_into_linux_runs_the_registered_task_after_the_delay(monkeypatch
     here would reboot into whatever the firmware happens to prefer."""
     later = []
     monkeypatch.setattr(plat, "_run_later", lambda delay, argv: later.append((delay, argv)))
+    monkeypatch.setattr(subprocess, "run", _schtasks_knowing(plat.BOOT_LINUX_TASK))
     plat.restart_into_linux(delay=3)
     assert later == [(3, ["schtasks", "/run", "/tn", plat.BOOT_LINUX_TASK])]
+
+
+def test_jarvis_switches_through_the_voice_task_once_it_is_installed(monkeypatch):
+    """Only JARVIS runs the voice task — the one that lets Linux log in without
+    the password. The shortcut keeps the plain task and its password."""
+    later = []
+    monkeypatch.setattr(plat, "_run_later", lambda delay, argv: later.append(argv))
+    monkeypatch.setattr(subprocess, "run", _schtasks_knowing(
+        plat.BOOT_LINUX_TASK, plat.BOOT_LINUX_VOICE_TASK))
+    plat.restart_into_linux()
+    assert later == [["schtasks", "/run", "/tn", plat.BOOT_LINUX_VOICE_TASK]]
+    assert plat.BOOT_LINUX_VOICE_TASK != plat.BOOT_LINUX_TASK
 
 
 def test_run_later_runs_the_command_in_a_process_of_its_own(tmp_path):
@@ -132,7 +145,7 @@ def test_a_vendor_tool_is_not_mistaken_for_linux():
     assert installer.linux_loaders(listing) == []
 
 
-def _click(tmp_path, firmware, set_exit=0):
+def _click(tmp_path, firmware, set_exit=0, pass_root=None):
     """Run what the task runs, against stand-ins for bcdedit and shutdown.
 
     Returns (what the two were asked to do, the reason given for failing).
@@ -147,7 +160,8 @@ def _click(tmp_path, firmware, set_exit=0):
         '@>>"%~dp0asked.log" echo shutdown %*\n', newline="\r\n")
     why = tmp_path / "why.txt"
     script = installer.switch_script(
-        LINUX_LOADER, str(tmp_path / "bcdedit.cmd"), str(tmp_path / "shutdown.cmd"))
+        LINUX_LOADER, str(tmp_path / "bcdedit.cmd"), str(tmp_path / "shutdown.cmd"),
+        pass_root)
     script += f"\nSet-Content -LiteralPath '{why}' -Value $why\n"
     subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
                     "-EncodedCommand", installer.encoded(script)],
@@ -162,6 +176,46 @@ def test_a_click_makes_linux_the_next_boot_then_restarts_without_forcing(tmp_pat
     asked, _ = _click(tmp_path, FIRMWARE)
     assert asked == [f"bcdedit /set {{fwbootmgr}} bootsequence {LINUX_ENTRY}",
                      "shutdown /r /t 0"]
+
+
+def _pass_in(root) -> Path:
+    return Path(root) / "EFI" / "jarvis" / "autologin-once"
+
+
+@windows_only
+def test_the_voice_task_leaves_the_login_pass_before_it_restarts(tmp_path):
+    esp = tmp_path / "esp"
+    esp.mkdir()
+    asked, _ = _click(tmp_path, FIRMWARE, pass_root=f"'{esp}'")
+    assert asked[-1] == "shutdown /r /t 0"
+    assert _pass_in(esp).exists()
+
+
+@windows_only
+def test_no_login_pass_when_the_switch_itself_failed(tmp_path):
+    """A pass left behind by a switch that never happened would log in the
+    next person to start Linux by hand."""
+    esp = tmp_path / "esp"
+    esp.mkdir()
+    _click(tmp_path, FIRMWARE, set_exit=1, pass_root=f"'{esp}'")
+    assert not _pass_in(esp).exists()
+
+
+@windows_only
+def test_the_switch_still_happens_when_the_pass_cannot_be_left(tmp_path):
+    asked, _ = _click(tmp_path, FIRMWARE, pass_root="$(throw 'no EFI partition')")
+    assert asked[-1] == "shutdown /r /t 0"
+
+
+def test_only_the_voice_task_leaves_a_pass():
+    plain = installer.switch_script(LINUX_LOADER, "bcdedit", "shutdown")
+    voice = installer.switch_script(LINUX_LOADER, "bcdedit", "shutdown",
+                                    installer.ESP_ROOT)
+    assert "autologin-once" not in plain and "@PASS@" not in plain
+    assert "autologin-once" in voice and "@ESP@" not in voice
+    # After the one-time boot is set, before the restart.
+    assert (voice.index("bootsequence") < voice.index("autologin-once")
+            < voice.index("/r /t 0"))
 
 
 @windows_only
@@ -268,7 +322,75 @@ def test_installing_on_linux_puts_the_repo_helper_where_jarvis_runs_it(monkeypat
         return subprocess.CompletedProcess(argv, 0)
 
     monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setenv("SUDO_USER", "tony")
     assert installer.install_linux_helper() == 0
-    (argv,) = ran
-    assert argv[0] == "sudo"
-    assert argv[-2:] == [str(HELPER), plat._BOOT_WINDOWS_HELPER]
+    assert all(argv[0] == "sudo" for argv in ran)
+    assert ran[0][-2:] == [str(HELPER), plat._BOOT_WINDOWS_HELPER]
+    # ...and the one-time login: its helper, its unit, switched on.
+    assert ran[1][-2:] == [str(AUTOLOGIN), installer.AUTOLOGIN_HELPER]
+    assert ran[2][-1] == f"/etc/systemd/system/{installer.AUTOLOGIN_UNIT}"
+    assert ran[-1] == ["sudo", "systemctl", "enable", installer.AUTOLOGIN_UNIT]
+
+
+def test_the_login_unit_runs_before_the_login_screen_for_the_installing_user():
+    unit = installer.autologin_unit("tony")
+    assert "Before=display-manager.service" in unit
+    assert "RequiresMountsFor=/boot/efi" in unit     # the pass is on the EFI partition
+    assert f"ExecStart={installer.AUTOLOGIN_HELPER} tony\n" in unit
+
+
+# --- Linux: logging in once, without the password, after a voice switch --------
+
+AUTOLOGIN = Path(installer.__file__).parent / "boot-switch" / "jarvis-autologin-once"
+
+
+def _boot(tmp_path, *, with_pass):
+    """Run the boot-time helper. Returns (the pass file, the SDDM config)."""
+    left, conf = tmp_path / "esp" / "autologin-once", tmp_path / "sddm" / "90.conf"
+    left.parent.mkdir(exist_ok=True)
+    conf.parent.mkdir(exist_ok=True)
+    if with_pass:
+        left.write_text("voice")
+    done = subprocess.run(["sh", str(AUTOLOGIN), "tony", "plasma", str(left), str(conf)],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    return left, conf
+
+
+@needs_sh
+def test_a_pass_logs_the_user_in_and_is_used_up(tmp_path):
+    left, conf = _boot(tmp_path, with_pass=True)
+    assert not left.exists()
+    assert conf.read_text() == "[Autologin]\nUser=tony\nSession=plasma\nRelogin=false\n"
+
+
+@needs_sh
+def test_no_pass_means_the_password_screen(tmp_path):
+    _, conf = _boot(tmp_path, with_pass=False)
+    assert not conf.exists()
+
+
+@needs_sh
+def test_the_boot_after_a_voice_switch_asks_for_the_password_again(tmp_path):
+    """One pass, one login: the next ordinary boot must not inherit it."""
+    _boot(tmp_path, with_pass=True)
+    _, conf = _boot(tmp_path, with_pass=False)
+    assert not conf.exists()
+
+
+@needs_sh
+def test_a_pass_that_cannot_be_used_up_is_not_honoured(tmp_path):
+    """Otherwise it would log in on every boot from then on."""
+    if os.geteuid() == 0:
+        pytest.skip("root can always delete")
+    left = tmp_path / "esp" / "autologin-once"
+    left.parent.mkdir()
+    left.write_text("voice")
+    left.parent.chmod(0o555)                         # like a read-only partition
+    try:
+        conf = tmp_path / "sddm.conf"
+        subprocess.run(["sh", str(AUTOLOGIN), "tony", "plasma", str(left), str(conf)],
+                       capture_output=True)
+        assert not conf.exists()
+    finally:
+        left.parent.chmod(0o755)

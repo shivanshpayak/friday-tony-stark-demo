@@ -179,6 +179,7 @@ from friday.providers import (
 from friday.voice_cache import PrerenderedLines, audio_stream
 from friday.routing import LocalDomainToolPool
 from friday.speaker_gate import get_speaker_gate
+from friday.mic_filter import HumFilter
 from friday.recovery import is_fatal_close
 
 # Repo root — used to locate server.py when spawning the MCP subprocess.
@@ -328,6 +329,7 @@ class FridayAgent(Agent):
                         # only warn once per outage
                         last_frame_at = 0.0
             alarm_task = asyncio.create_task(_no_frame_alarm())
+            hum = HumFilter()   # mains hum reads as endless speech to the STT
             try:
                 async for f in src:
                     now = loop.time()
@@ -340,7 +342,7 @@ class FridayAgent(Agent):
                         logger.info("stt_node: %d frames in last interval", count)
                         last_log_at = now
                         count = 0
-                    yield f
+                    yield hum.frame(f)
             finally:
                 alarm_task.cancel()
 

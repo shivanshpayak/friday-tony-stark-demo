@@ -16,6 +16,7 @@ Usage:
 import argparse
 import base64
 import ctypes
+import getpass
 import os
 import re
 import subprocess
@@ -26,7 +27,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from friday.plat import _BOOT_WINDOWS_HELPER, BOOT_LINUX_TASK
+from friday.plat import _BOOT_WINDOWS_HELPER, BOOT_LINUX_TASK, BOOT_LINUX_VOICE_TASK
 
 SHORTCUT_NAME = "Restart into Linux.lnk"
 
@@ -68,10 +69,29 @@ $why = 'the Linux boot entry was not found'
 if ($id) {
     & @BCDEDIT@ /set '{fwbootmgr}' bootsequence $id | Out-Null
     # /t 0 does not force: apps with unsaved work still get to ask first.
-    if ($LASTEXITCODE -eq 0) { & @SHUTDOWN@ /r /t 0; exit 0 }
+    if ($LASTEXITCODE -eq 0) { @PASS@& @SHUTDOWN@ /r /t 0; exit 0 }
     $why = 'the firmware refused the one-time boot'
 }
 """
+
+# The voice task only: leave Linux a one-time pass to log in without the
+# password (boot-switch/jarvis-autologin-once takes it away at boot). It goes on
+# the EFI system partition, the one partition both systems can read. Failing to
+# leave it must never stop the switch — Linux then just asks for the password.
+_LEAVE_PASS = r"""
+        try {
+            $esp = @ESP@
+            if ($esp) {
+                [IO.Directory]::CreateDirectory("$esp\EFI\jarvis") | Out-Null
+                [IO.File]::WriteAllText("$esp\EFI\jarvis\autologin-once", 'voice')
+            }
+        } catch { }
+        """
+
+# The EFI system partition has no drive letter; reach it by its volume path.
+ESP_ROOT = ("((Get-Partition | Where-Object { $_.GptType -eq "
+            "'{c12a7328-f81f-11d2-ba4b-00a0c93ec93b}' } | Select-Object -First 1 "
+            "| Get-Volume).Path).TrimEnd('\\')")
 
 _TELL_THE_USER = r"""
 (New-Object -ComObject WScript.Shell).Popup(
@@ -86,11 +106,18 @@ def _ps(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
-def switch_script(loader: str, bcdedit: str, shutdown: str) -> str:
+def switch_script(loader: str, bcdedit: str, shutdown: str,
+                  pass_root: str | None = None) -> str:
     """PowerShell that makes `loader`'s firmware entry the next boot only, then
     restarts — but only if that worked. Otherwise it falls through with the
-    reason in $why."""
-    return (_SWITCH.replace("@BCDEDIT@", _ps(bcdedit))
+    reason in $why.
+
+    `pass_root` is a PowerShell expression for the EFI system partition's root
+    (ESP_ROOT): given, the script also leaves the autologin pass there, after
+    the one-time boot is set and before the restart. None leaves no pass."""
+    leave = _LEAVE_PASS.replace("@ESP@", pass_root) if pass_root else ""
+    return (_SWITCH.replace("@PASS@", leave)
+                   .replace("@BCDEDIT@", _ps(bcdedit))
                    .replace("@SHUTDOWN@", _ps(shutdown))
                    .replace("@LOADER@", _ps(loader.lower())))
 
@@ -140,14 +167,16 @@ _TASK_XML = """\
 """
 
 
-def task_xml(loader: str) -> str:
+def task_xml(loader: str, leave_pass: bool = False) -> str:
     """The task: on demand only, elevated, for the user installing it. Its
-    whole action is in the definition — it runs no file the user can edit."""
+    whole action is in the definition — it runs no file the user can edit.
+    `leave_pass` makes it the voice task (see plat.BOOT_LINUX_VOICE_TASK)."""
     system32 = _system32()
     user = subprocess.run([str(system32 / "whoami.exe")], capture_output=True,
                           text=True, check=True).stdout.strip()
     script = switch_script(loader, str(system32 / "bcdedit.exe"),
-                           str(system32 / "shutdown.exe")) + _TELL_THE_USER
+                           str(system32 / "shutdown.exe"),
+                           ESP_ROOT if leave_pass else None) + _TELL_THE_USER
     return _TASK_XML.format(
         user=escape(user),
         command=escape(str(system32 / "WindowsPowerShell" / "v1.0" / "powershell.exe")),
@@ -186,16 +215,75 @@ def _shortcut_folders() -> list[Path]:
 
 # --- the Linux side ------------------------------------------------------------
 
-def install_linux_helper() -> int:
-    """Put boot-switch/boot-windows-next where JARVIS runs it (asks for sudo).
+AUTOLOGIN_HELPER = "/usr/local/sbin/jarvis-autologin-once"
+AUTOLOGIN_UNIT = "jarvis-autologin-once.service"
+AUTOLOGIN_CONF = "/etc/sddm.conf.d/90-jarvis-autologin.conf"
+_SOURCES = Path(__file__).resolve().parent / "boot-switch"
 
-    Only the helper: the sudoers rule that lets it run without a password is
-    already in place and names this same path.
+
+def autologin_unit(user: str) -> str:
+    """The systemd unit that runs the autologin helper before the login screen."""
+    return f"""[Unit]
+Description=JARVIS: log in without the password once, after a voice switch from Windows
+RequiresMountsFor=/boot/efi
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart={AUTOLOGIN_HELPER} {user}
+
+[Install]
+WantedBy=graphical.target
+"""
+
+
+def _sudo_install(source: Path, target: str, mode: str = "755") -> int:
+    return subprocess.run(["sudo", "install", "--backup", "-o", "root", "-g", "root",
+                           "-m", mode, str(source), target]).returncode
+
+
+def install_linux_helper() -> int:
+    """Put the two root helpers in place (asks for sudo).
+
+    boot-windows-next is what JARVIS runs to switch to Windows; the sudoers
+    rule that lets it run without a password is already in place and names
+    this same path. jarvis-autologin-once runs at boot, before the login
+    screen, and logs this user in once if the Windows side left a pass.
     """
-    source = Path(__file__).resolve().parent / "boot-switch" / "boot-windows-next"
-    code = subprocess.run(["sudo", "install", "--backup", "-o", "root", "-g", "root",
-                           "-m", "755", str(source), _BOOT_WINDOWS_HELPER]).returncode
-    print(f"Installed {_BOOT_WINDOWS_HELPER}." if code == 0 else "Nothing was installed.")
+    code = _sudo_install(_SOURCES / "boot-windows-next", _BOOT_WINDOWS_HELPER)
+    if code != 0:
+        print("Nothing was installed.")
+        return code
+    print(f"Installed {_BOOT_WINDOWS_HELPER}.")
+
+    user = os.environ.get("SUDO_USER") or getpass.getuser()
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]*", user) or user == "root":
+        print(f"Not setting up the one-time login: unexpected user name {user!r}.")
+        return 1
+    folder = Path(tempfile.mkdtemp(prefix="jarvis-boot-switch-"))
+    unit = folder / AUTOLOGIN_UNIT
+    try:
+        unit.write_text(autologin_unit(user), encoding="utf-8")
+        code = (_sudo_install(_SOURCES / "jarvis-autologin-once", AUTOLOGIN_HELPER)
+                or _sudo_install(unit, f"/etc/systemd/system/{AUTOLOGIN_UNIT}", "644")
+                or subprocess.run(["sudo", "systemctl", "daemon-reload"]).returncode
+                or subprocess.run(["sudo", "systemctl", "enable", AUTOLOGIN_UNIT]).returncode)
+    finally:
+        unit.unlink(missing_ok=True)
+        folder.rmdir()
+    print(f"One-time login after a voice switch from Windows: on, for {user}."
+          if code == 0 else "The one-time login was NOT set up.")
+    return code
+
+
+def uninstall_linux_autologin() -> int:
+    """Turn the one-time login off again. boot-windows-next is left in place."""
+    subprocess.run(["sudo", "systemctl", "disable", AUTOLOGIN_UNIT])
+    code = subprocess.run(["sudo", "rm", "-f", f"/etc/systemd/system/{AUTOLOGIN_UNIT}",
+                           AUTOLOGIN_HELPER, AUTOLOGIN_CONF]).returncode
+    subprocess.run(["sudo", "systemctl", "daemon-reload"])
+    print(f"One-time login removed. {_BOOT_WINDOWS_HELPER} is left in place."
+          if code == 0 else "Could not remove the one-time login.")
     return code
 
 
@@ -233,20 +321,27 @@ def _as_admin(args) -> int:
         done = subprocess.run([schtasks, "/delete", "/tn", BOOT_LINUX_TASK, "/f"],
                               capture_output=True, text=True)
         print((done.stdout or done.stderr).strip())
+        subprocess.run([schtasks, "/delete", "/tn", BOOT_LINUX_VOICE_TASK, "/f"],
+                       capture_output=True, text=True)
         return done.returncode
     loader = _choose_loader(args.loader)
     if loader is None:
         return 1
     definition = Path(tempfile.mkdtemp(prefix="jarvis-boot-switch-")) / "task.xml"
     try:
-        definition.write_text(task_xml(loader), encoding="utf-16")
-        done = subprocess.run([schtasks, "/create", "/tn", BOOT_LINUX_TASK,
-                               "/xml", str(definition), "/f"],
-                              capture_output=True, text=True)
+        # The plain task (the shortcut), then the voice task (JARVIS only).
+        for name, leave_pass in ((BOOT_LINUX_TASK, False),
+                                 (BOOT_LINUX_VOICE_TASK, True)):
+            definition.write_text(task_xml(loader, leave_pass), encoding="utf-16")
+            done = subprocess.run([schtasks, "/create", "/tn", name,
+                                   "/xml", str(definition), "/f"],
+                                  capture_output=True, text=True)
+            print((done.stdout or done.stderr).strip())
+            if done.returncode != 0:
+                break
     finally:
         definition.unlink(missing_ok=True)
         definition.parent.rmdir()
-    print((done.stdout or done.stderr).strip())
     return done.returncode
 
 
@@ -280,8 +375,7 @@ def main() -> int:
     args = parser.parse_args()
     if sys.platform != "win32":
         if args.command == "uninstall":
-            print(f"Nothing to remove here: {_BOOT_WINDOWS_HELPER} is left in place.")
-            return 1
+            return uninstall_linux_autologin()
         return install_linux_helper()
 
     if args.elevated:       # we are the elevated copy: report through the log

@@ -139,6 +139,11 @@ def restart_into_windows(delay: float = 6.0) -> None:
 # elevated, makes Linux the next boot only (UEFI one-shot) and restarts. Running
 # it needs no UAC prompt. Registered once by install_boot_switch.py.
 BOOT_LINUX_TASK = "JARVIS Restart into Linux"
+# The same, plus a one-time pass that lets Linux log in without the password
+# (boot-switch/jarvis-autologin-once). Only JARVIS runs this one: the user has
+# just been recognised by voice. The shortcut runs the plain task, so a switch
+# by hand still ends at the password.
+BOOT_LINUX_VOICE_TASK = "JARVIS Voice Switch to Linux"
 
 _WAIT_THEN_RUN = ("import subprocess, sys, time; "
                   "time.sleep(float(sys.argv[1])); subprocess.run(sys.argv[2:])")
@@ -153,12 +158,15 @@ def can_restart_into_linux() -> str | None:
     """None if a reboot into Linux can be triggered, else why not."""
     if not IS_WINDOWS:
         return "already on Linux"
-    registered = subprocess.run(["schtasks", "/query", "/tn", BOOT_LINUX_TASK],
-                                capture_output=True, timeout=5,
-                                creationflags=_NO_WINDOW)
-    if registered.returncode != 0:
+    if not _task_registered(BOOT_LINUX_TASK):
         return "the boot-switch helper isn't installed"
     return None
+
+
+def _task_registered(name: str) -> bool:
+    return subprocess.run(["schtasks", "/query", "/tn", name],
+                          capture_output=True, timeout=5,
+                          creationflags=_NO_WINDOW).returncode == 0
 
 
 def restart_into_linux(delay: float = 6.0) -> None:
@@ -166,8 +174,14 @@ def restart_into_linux(delay: float = 6.0) -> None:
 
     The task restarts without forcing, so apps with unsaved work get to ask
     before the session ends. Detached: it must outlive the tool server.
+
+    Runs the voice task (Linux then logs in by itself, once) when the
+    installer has registered it; otherwise the plain one, so switching keeps
+    working on an install that predates it.
     """
-    _run_later(delay, ["schtasks", "/run", "/tn", BOOT_LINUX_TASK])
+    task = (BOOT_LINUX_VOICE_TASK if _task_registered(BOOT_LINUX_VOICE_TASK)
+            else BOOT_LINUX_TASK)
+    _run_later(delay, ["schtasks", "/run", "/tn", task])
 
 
 def can_restart_into(os_name: str) -> str | None:

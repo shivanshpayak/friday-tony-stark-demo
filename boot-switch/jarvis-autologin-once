@@ -1,0 +1,31 @@
+#!/bin/sh
+# Log in without a password for THIS boot only, if the Windows side left a pass.
+#
+# "Switch to Linux" spoken to JARVIS on Windows drops a file on the EFI system
+# partition (the one partition both systems can read) before it restarts. This
+# runs as root before the login screen starts: it takes the pass away and tells
+# SDDM to log the user in. Without a pass it makes sure autologin is off — so a
+# normal power-on, a restart from Linux, or the "Restart into Linux" shortcut
+# all still ask for the password. Waking from sleep is the lock screen, which
+# this never touches.
+#
+# Lives root-owned at /usr/local/sbin, started by jarvis-autologin-once.service.
+# Put there with:  python install_boot_switch.py install
+#
+# usage: jarvis-autologin-once USER [SESSION] [PASS_FILE] [SDDM_CONF]
+set -eu
+
+user=$1
+session=${2:-plasma}
+pass=${3:-/boot/efi/EFI/jarvis/autologin-once}
+conf=${4:-/etc/sddm.conf.d/90-jarvis-autologin.conf}
+
+# Whatever the last boot was allowed, this one starts with nothing.
+rm -f "$conf"
+
+[ -e "$pass" ] || exit 0
+# A pass that cannot be taken away would log in on every boot from now on.
+rm -f "$pass" || exit 0
+[ ! -e "$pass" ] || exit 0
+
+printf '[Autologin]\nUser=%s\nSession=%s\nRelogin=false\n' "$user" "$session" > "$conf"
