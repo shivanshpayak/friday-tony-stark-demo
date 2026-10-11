@@ -7,6 +7,8 @@ If no embedding file exists, the gate is disabled and all audio passes through.
 """
 
 import numpy as np
+
+from .voiceprint import clean_clip
 from .config import (
     VOICE_EMBEDDING_PATH, SPEAKER_SIM_THRESHOLD, SESSION_SPEAKER_GATE_ENABLED, logger,
 )
@@ -52,7 +54,7 @@ class SessionSpeakerGate:
                 wav = resample(wav, int(len(wav) * 16000 / sample_rate))
             if len(wav) < 1600:  # < 100 ms — too short for reliable embedding
                 return True
-            emb = self._encoder.embed_utterance(wav)
+            emb = self._encoder.embed_utterance(clean_clip(wav))
             ref = self._reference
             sim = float(np.dot(emb, ref) /
                         (np.linalg.norm(emb) * np.linalg.norm(ref) + 1e-9))

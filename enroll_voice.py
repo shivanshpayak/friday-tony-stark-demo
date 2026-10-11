@@ -37,6 +37,7 @@ import numpy as np
 import pyaudio
 
 from friday import plat
+from friday.voiceprint import clean_clip
 
 ROOT = Path(__file__).parent
 OUTPUT_PATH = plat.voice_embedding_path()   # this OS's fingerprint
@@ -50,7 +51,7 @@ WAKE_THRESHOLD = 0.7
 AUDIO_RATE = 16000
 AUDIO_CHUNK = 1280
 SPEAKER_BUFFER_SECONDS = 2.5
-SPEAKER_SIM_THRESHOLD = 0.70
+SPEAKER_SIM_THRESHOLD = 0.65
 
 SAMPLES = 10
 SAMPLE_TIMEOUT = 25.0     # seconds to wait for one "Hey Jarvis"
@@ -198,7 +199,7 @@ def main():
         print("  computing voice fingerprint...")
         from resemblyzer import VoiceEncoder
         encoder = VoiceEncoder(verbose=False)
-        embeddings = [_unit(encoder.embed_utterance(clip)) for clip in clips]
+        embeddings = [_unit(encoder.embed_utterance(clean_clip(clip))) for clip in clips]
         fingerprint = _unit(np.mean(embeddings, axis=0))
 
         # Honest self-check: score each clip against a fingerprint built from

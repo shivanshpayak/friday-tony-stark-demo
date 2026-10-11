@@ -33,6 +33,7 @@ from friday.recovery import (
 )
 from friday.config import FASTPATH_ENABLED, TEXT_TURN_TIMEOUT
 from friday import handoff, plat, quiet
+from friday.voiceprint import clean_clip
 
 _WIN = sys.platform == "win32"
 if _WIN:
@@ -216,7 +217,7 @@ SESSION_MIC = os.getenv("SESSION_MIC", "").strip()
 
 # Speaker verification
 VOICE_EMBEDDING_PATH = plat.voice_embedding_path()   # one fingerprint per OS
-SPEAKER_SIM_THRESHOLD = 0.70   # was 0.70 — stricter "is this the enrolled voice"
+SPEAKER_SIM_THRESHOLD = 0.65   # "is this the enrolled voice" (clips are cleaned first — friday/voiceprint.py)
 SPEAKER_BUFFER_SECONDS = 2.5   # last N seconds of mic audio to verify against
 
 # openwakeword occasionally fires on a near-silent mic (idle, or at night).
@@ -459,7 +460,7 @@ class SpeakerVerifier:
             started = time.monotonic()
             dummy = (np.random.randn(AUDIO_RATE) * 0.01).astype(np.float32)
             with self._lock:
-                self._encoder.embed_utterance(dummy)
+                self._encoder.embed_utterance(clean_clip(dummy))
             logger.info("Speaker verifier warm (%.1fs JIT paid at boot)",
                         time.monotonic() - started)
         except Exception as e:
@@ -471,7 +472,7 @@ class SpeakerVerifier:
             return True, 1.0
         try:
             with self._lock:
-                emb = self._encoder.embed_utterance(wav_float)
+                emb = self._encoder.embed_utterance(clean_clip(wav_float))
             ref = self._reference
             sim = float(np.dot(emb, ref) / ((np.linalg.norm(emb) * np.linalg.norm(ref)) + 1e-9))
             return sim >= self._threshold, sim

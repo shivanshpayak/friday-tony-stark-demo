@@ -290,7 +290,9 @@ class FridayAgent(Agent):
         super().__init__(
             instructions=full_prompt,
             stt=stt, llm=llm, tts=tts,
-            vad=vad or WebRTCVAD(
+            # No VAD at all when the STT ends turns: its false "speech
+            # started" on noise would cancel a turn that had just ended.
+            vad=None if _stt_ends_turns() else vad or WebRTCVAD(
                 aggressiveness=2,
                 min_speech_frames=5,   # 100 ms minimum speech
                 min_silence_frames=25, # 500 ms silence to end turn
@@ -505,6 +507,17 @@ class FridayAgent(Agent):
 
 def _endpointing_delay() -> float:
     return {"sarvam": 0.07, "whisper": 0.3}.get(STT_PROVIDER, 0.1)
+
+
+def _stt_ends_turns() -> bool:
+    """True when the STT service decides the user has stopped talking.
+
+    The local WebRTC VAD hears steady mic noise as speech (a 120 Hz mains hum
+    on a charging laptop kept it "speaking" for minutes), so the turn never
+    ended and the agent sat silent on a finished transcript. Deepgram's own
+    endpointing isn't fooled; other providers still need the VAD.
+    """
+    return STT_PROVIDER == "deepgram"
 
 
 _text_turn_lock = asyncio.Lock()
@@ -861,7 +874,7 @@ async def entrypoint(ctx: JobContext) -> None:
         aec_warmup_duration=0.0,
         conn_options=build_session_conn_options(),
         turn_handling=TurnHandlingOptions(
-            turn_detection="vad",
+            turn_detection="stt" if _stt_ends_turns() else "vad",
             endpointing=EndpointingOptions(
                 min_delay=_endpointing_delay(),
                 max_delay=0.8,

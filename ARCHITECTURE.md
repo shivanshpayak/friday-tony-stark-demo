@@ -322,6 +322,18 @@ Linux gotchas:
   gate and `enroll_voice.py` all take the path from `plat.voice_embedding_path()`,
   so run `enroll_voice.py` once on each OS. On Windows it finds the running
   launcher by command line (no PID file there) to stop and restart it.
+- **Fingerprint clips are cleaned first** (`friday/voiceprint.py`). The 2.5s
+  behind a wake word is ~1s of "Hey Jarvis" and the rest room noise; embedded
+  raw, a different room or mic distance pushed the owner to 0.55–0.66 and the
+  wake word was ignored. Silence is cut (webrtcvad) and volume levelled before
+  embedding — in the wake gate, the in-session gate and enrollment alike, so
+  re-enroll after changing it. Wake threshold is 0.65.
+- **Deepgram ends the user's turn, not the local VAD** (`_stt_ends_turns` in
+  `agent_friday.py`; `turn_detection="stt"`, Deepgram `endpointing_ms=300`, no
+  VAD on the agent). The WebRTC VAD hears steady mic noise as speech: a 120 Hz
+  mains hum on the charging laptop kept it "speaking" indefinitely, so a
+  finished transcript never became a turn and JARVIS sat silent (typed
+  requests still worked). Other STT providers keep the VAD.
 
 ## 6b. Quiet mode and typed requests
 

@@ -49,7 +49,9 @@ def register(mcp: FastMCP):
         "windows" or "linux"; leave empty for whichever one this is not.
 
         Set `restart_now` ONLY when the user asked to switch right now — it
-        restarts the computer. In that case first say one short line such as
-        "Going to Linux, sir." and nothing after it.
+        restarts the computer. Saying you will switch does nothing: the restart
+        happens only when you CALL this tool. Say exactly "Switching, sir.
+        I'll see you on the other side." and call this tool in the same turn;
+        say nothing once it returns.
         """
         return _leave_task_for_other_os(request, target_os, restart_now)

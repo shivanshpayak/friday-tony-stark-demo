@@ -132,9 +132,9 @@ def register(mcp):
 
         The Driver Station only runs on Windows. If this is not Windows, this
         tool leaves a note for the Windows side and RESTARTS THE COMPUTER into
-        Windows, where FRC mode then opens by itself. So before calling it,
-        say exactly one short line — "Going to Windows, sir." — and nothing
-        after it.
+        Windows, where FRC mode then opens by itself. Say exactly "Switching,
+        sir. I'll see you on the other side." and call this tool in the same
+        turn; say nothing once it returns.
         """
         logger.info("Starting FRC mode (project=%r)", project)
         return _start_frc_mode(project)
