@@ -1,5 +1,7 @@
 """Cross-OS handoff: a task left on one OS runs once, on the other, and only
 while it is still fresh."""
+import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -175,3 +177,111 @@ def test_an_empty_note_is_never_queued(switching, monkeypatch):
     monkeypatch.setattr(handoff, "current_os", lambda: "windows")
     handoff_tool._leave_task_for_other_os("", "linux", restart_now=False)
     assert switching["left"] == [] and switching["restarts"] == []
+
+
+# --- pickup: the side that picks a task up says so ----------------------------
+# The pickup ran as a silent typed request: the apps opened and JARVIS said
+# nothing, so there was no telling a finished handoff from a boot that had
+# simply landed on the other OS. Now a second turn confirms it out loud.
+
+def _frc_task():
+    return handoff.HandoffTask(request="FRC mode", target_os="windows", created_on="linux")
+
+
+def test_the_confirmation_welcomes_back_and_knows_how_the_task_went(monkeypatch):
+    monkeypatch.setattr(handoff, "current_os", lambda: "windows")
+    asked = handoff.pickup_confirmation(_frc_task(), "opened robot code, Driver Station")
+    assert "Welcome back to Windows, sir." in asked
+    assert '"FRC mode"' in asked
+    assert "opened robot code, Driver Station" in asked
+
+
+def test_only_the_first_pickup_of_a_boot_welcomes_back(monkeypatch):
+    """Two tasks waiting must not greet twice in a row."""
+    monkeypatch.setattr(handoff, "current_os", lambda: "linux")
+    asked = handoff.pickup_confirmation(_frc_task(), "done", greet=False)
+    assert '"FRC mode"' in asked
+    assert "Welcome back" not in asked
+
+
+class _FakeTextSession:
+    """Records how a typed turn was run: the speaker, and the reply options."""
+
+    class _Handle:
+        chat_items = ()
+
+        def __await__(self):
+            return iter(())
+
+    def __init__(self):
+        self.output = self
+        self.speaker = []
+        self.reply_options = None
+
+    def set_audio_enabled(self, on):
+        self.speaker.append(on)
+
+    def generate_reply(self, *, user_input=None, **options):
+        self.reply_options = options
+        return self._Handle()
+
+
+def _text_turn(request: dict) -> _FakeTextSession:
+    import agent_friday
+    session = _FakeTextSession()
+    asyncio.run(agent_friday._text_turn(session, json.dumps(request), lambda: False))
+    return session
+
+
+def test_a_typed_request_is_still_silent_and_may_use_tools():
+    session = _text_turn({"id": "t1", "text": "FRC mode"})
+    assert session.speaker == [False, True]
+    assert session.reply_options == {}
+
+
+def test_an_announcement_is_said_aloud_and_cannot_act():
+    """With tools it could carry the task out a second time."""
+    session = _text_turn({"id": "t1", "text": "Tell the user…", "announce": True})
+    assert session.speaker == []
+    assert session.reply_options == {"tool_choice": "none"}
+
+
+def test_the_launcher_marks_an_announcement_for_the_agent():
+    from tests.test_session_recovery import _patch_and_import_launcher
+    agent, sent = _patch_and_import_launcher().AgentProcess(), []
+    agent._send = lambda cmd: bool(sent.append(cmd))      # "agent is not running"
+    asyncio.run(agent.ask("Tell the user…", announce=True))
+    assert json.loads(sent[0][len("TEXT "):])["announce"] is True
+
+
+class _ToolDescriptions:
+    """Stands in for FastMCP: keeps what the model would be told per tool."""
+
+    def __init__(self):
+        self.told = {}
+
+    def tool(self, name=None, description=None, **kw):
+        def keep(fn):
+            self.told[name or fn.__name__] = description or fn.__doc__
+            return fn
+        return keep
+
+
+def _frc_mode_description(monkeypatch, *, on_windows: bool) -> str:
+    monkeypatch.setattr(plat, "IS_WINDOWS", on_windows)
+    mcp = _ToolDescriptions()
+    frc.register(mcp)
+    return " ".join(mcp.told["start_frc_mode"].split())
+
+
+def test_frc_mode_on_windows_is_not_told_to_announce_a_switch(monkeypatch):
+    """Told to, the pickup said "Going to Windows, sir." while already there —
+    and was told to say nothing after, which is where the confirmation goes."""
+    told = _frc_mode_description(monkeypatch, on_windows=True)
+    assert "FRC mode" in told
+    assert "Switching" not in told and "RESTARTS" not in told
+
+
+def test_frc_mode_off_windows_still_announces_the_switch(monkeypatch):
+    told = _frc_mode_description(monkeypatch, on_windows=False)
+    assert "Switching, sir." in told and "RESTARTS THE COMPUTER" in told

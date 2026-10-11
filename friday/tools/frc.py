@@ -120,22 +120,29 @@ def _start_frc_mode(project: str = "") -> str:
     return "Handoff queued. Restarting into Windows now."
 
 
+_FRC_MODE_DOC = """
+Enter FRC mode: set the machine up for robot work (robot code, Driver
+Station, dashboard, logs). Use when the user says "FRC mode", "robot
+mode", "set up for robotics", "let's work on the robot", or similar.
+`project` is optional — a spoken project name.
+"""
+
+# Told to the model only where it is true. On Windows it made the pickup after
+# a switch announce one ("Going to Windows, sir.") and then say nothing more —
+# which is where the confirmation belongs.
+_FRC_SWITCH_DOC = """
+The Driver Station only runs on Windows. This is not Windows, so this
+tool leaves a note for the Windows side and RESTARTS THE COMPUTER into
+Windows, where FRC mode then opens by itself. Say exactly "Switching,
+sir. I'll see you on the other side." and call this tool in the same
+turn; say nothing once it returns.
+"""
+
+
 def register(mcp):
 
-    @mcp.tool()
+    @mcp.tool(description=_FRC_MODE_DOC + ("" if plat.IS_WINDOWS else _FRC_SWITCH_DOC))
     def start_frc_mode(project: str = "") -> str:
-        """
-        Enter FRC mode: set the machine up for robot work (robot code, Driver
-        Station, dashboard, logs). Use when the user says "FRC mode", "robot
-        mode", "set up for robotics", "let's work on the robot", or similar.
-        `project` is optional — a spoken project name.
-
-        The Driver Station only runs on Windows. If this is not Windows, this
-        tool leaves a note for the Windows side and RESTARTS THE COMPUTER into
-        Windows, where FRC mode then opens by itself. Say exactly "Switching,
-        sir. I'll see you on the other side." and call this tool in the same
-        turn; say nothing once it returns.
-        """
         logger.info("Starting FRC mode (project=%r)", project)
         return _start_frc_mode(project)
 

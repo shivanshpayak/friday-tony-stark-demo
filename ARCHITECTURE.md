@@ -358,6 +358,9 @@ reply (print / notification) <─ launcher <─ stdout "TEXT_REPLY {json}" <─�
   so it works asleep or mid-conversation and never touches the activation queue.
   Same history, tools and prompt as voice; with no voice session live, audio
   output is switched off for the turn, so no TTS is synthesised at all.
+- A request with `"announce": true` (`AgentProcess.ask(…, announce=True)`) is a
+  line to say, not a thing to do: audio stays on and the turn runs with
+  `tool_choice="none"`. Used by the cross-OS handoff's confirmation (below).
 - The launcher matches `TEXT_REPLY` before its other stdout signals: reply text
   is arbitrary and could contain "SPEAKING" or "PROCESSING".
 - `friday_krunner.py` is a D-Bus service (`org.kde.krunner1`, bus-activated). It
@@ -382,6 +385,8 @@ already have; `FRIDAY_HANDOFF_DIR` swaps in a folder queue.
 Linux:   "FRC mode" ─> start_frc_mode ─> handoff.leave_task("FRC mode", windows)
                                       └> plat.restart_into_windows()  (firmware one-shot + KDE logout)
 Windows: launcher boots ─> agent ready ─> handoff.claim_pending() ─> agent.ask(task) ─> queue.finish(done)
+                                          ─> agent.ask(handoff.pickup_confirmation(…), announce=True)
+                                             "Welcome back to Windows, sir. Opened up FRC mode for you."
 
 Windows: "switch to Linux [and …]" ─> leave_task_for_other_os ─> handoff.leave_task(…, linux)   (only if there is a task)
                                                               └> plat.restart_into_linux() ─> schtasks /run "JARVIS Restart into Linux"
@@ -396,6 +401,15 @@ Windows: "switch to Linux [and …]" ─> leave_task_for_other_os ─> handoff.l
 - Tasks expire after 12 hours (`handoff.MAX_AGE`) and are retired unrun.
 - Pickup runs after `FRIDAY_READY` as a background task, through the silent
   typed-request path, so it never delays the wake word and respects quiet mode.
+- **Then it is confirmed out loud**, in a turn of its own: "Welcome back to
+  Windows, sir. Opened up FRC mode for you." (`handoff.pickup_confirmation`,
+  sent as an `announce` request — spoken, no tools). The welcome is only on the
+  first task of a boot; a part that failed is named instead of claimed. In quiet
+  mode the outcome is a notification instead. A bare switch leaves no task, so
+  there is nothing to confirm and nothing is said.
+  - Two turns, not one: asked to act and confirm together, the model said the
+    confirmation before acting and again after, or said it and never acted
+    (dry runs against the real model, 2026-10-11).
 - `leave_task_for_other_os` (friday/tools/handoff.py) is the general tool:
   "next time I'm on Windows, …". With `restart_now` it also switches, in either
   direction; a bare "switch to Linux" restarts without queuing an empty note.
@@ -429,10 +443,24 @@ Windows: "switch to Linux [and …]" ─> leave_task_for_other_os ─> handoff.l
   hands-free: the one-shot only gets as far as GRUB. That is `GRUB_TIMEOUT` (and
   on Ubuntu `GRUB_RECORDFAIL_TIMEOUT`) in `/etc/default/grub`, then regenerate
   `grub.cfg`.
+- **Both OSes must agree on the hardware clock.** Linux keeps it in UTC, Windows
+  reads it as local time, so after a boot from Linux Windows runs hours ahead
+  (4 h in EDT; measured 2026-10-11, with the Windows Time service stopped).
+  Google then rejects the TTS service account — 401 `ACCESS_TOKEN_EXPIRED`,
+  "failed to synthesize speech" — and JARVIS is mute on Windows except for the
+  pre-rendered wake lines; commit times from the two sides also interleave
+  wrongly. Fix on Windows, once, elevated: `RealTimeIsUniversal=1` (DWORD) under
+  `HKLM\SYSTEM\CurrentControlSet\Control\TimeZoneInformation` (set 2026-10-11;
+  it applies from the next restart — System log, Kernel-General event 25, then
+  reads "RTC time is in UTC: true"). A JARVIS started under a wrong clock keeps
+  its rejected sign-in for hours: after any clock correction, restart it.
 
 **FRC mode** (`start_frc_mode` in `friday/tools/frc.py`): on Windows it opens
 FRC VS Code, the Driver Station (which brings Elastic up) and AdvantageScope. On
 Linux, where the Driver Station doesn't exist, it hands off to Windows as above.
+The tool's description is built per OS: only off Windows does it tell the model
+that it restarts the computer and to say "Switching, sir. …" — read on Windows,
+the model announced a switch while already there.
 Spoken names for these apps live in `APP_DISCOVERED_ALIASES`.
 
 ## 6. Windows / platform gotchas (applied fixes)

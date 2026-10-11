@@ -541,6 +541,9 @@ async def _text_turn(session, payload: str, voice_active) -> None:
     prompt — but with audio output switched off, so nothing is synthesised or
     played: this is the path that works in quiet mode. If a voice conversation
     is already under way the audio is left alone and the reply is spoken too.
+    A request marked `announce` is the opposite: something to say, not to do —
+    spoken aloud, and answered without tools ("Welcome back to Windows, sir.
+    Opened up FRC mode for you." after an OS switch, friday/handoff.py).
     """
     request_id, reply, error = None, "", None
     try:
@@ -550,11 +553,13 @@ async def _text_turn(session, payload: str, voice_active) -> None:
         if not text:
             raise ValueError("empty request")
         async with _text_turn_lock:
-            silent = not voice_active()
+            announce = bool(request.get("announce"))
+            silent = not (voice_active() or announce)
             if silent:
                 session.output.set_audio_enabled(False)
             try:
-                handle = session.generate_reply(user_input=text)
+                handle = session.generate_reply(
+                    user_input=text, **({"tool_choice": "none"} if announce else {}))
                 await asyncio.wait_for(handle, timeout=TEXT_TURN_TIMEOUT)
                 reply = _reply_text(handle)
             finally:

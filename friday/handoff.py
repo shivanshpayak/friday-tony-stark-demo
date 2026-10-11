@@ -247,3 +247,27 @@ def claim_pending(queue=None, *, retries: int = 3, delay: float = 4.0) -> list[H
         else:
             fresh.append(task)
     return fresh
+
+
+def pickup_confirmation(task: HandoffTask, outcome: str, *, greet: bool = True) -> str:
+    """What the agent is asked to SAY once `task` has been carried out here:
+    "Welcome back to Windows, sir. Opened up FRC mode for you."
+
+    A turn of its own, after the task and without tools. Asked to act and
+    confirm in a single turn, the model said the confirmation before acting and
+    again after, or said it and never acted (dry runs, 2026-10-11).
+
+    `greet` is for the first task of a boot — a second one must not welcome
+    him back again.
+    """
+    here = current_os().capitalize()
+    welcome = f"Welcome back to {here}, sir. " if greet else ""
+    opening = f'Begin with exactly "{welcome.strip()}" and then say' if greet else "Say"
+    return (
+        f"The computer has just restarted into {here}, and you have just "
+        f'carried out a task left from {task.created_on.capitalize()}: '
+        f'"{task.request}". How it went: "{outcome}". Tell the user, in one '
+        f"line. {opening} what you did in a few words — for an \"FRC mode\" "
+        f'that went well: "{welcome}Opened up FRC mode for you." If any part '
+        "of it failed, name that part instead of claiming it. Nothing else."
+    )

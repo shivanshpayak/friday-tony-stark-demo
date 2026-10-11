@@ -790,18 +790,20 @@ class AgentProcess:
 
         loop.call_soon_threadsafe(_finish)   # we're on the stdout reader thread
 
-    async def ask(self, text: str, timeout: float = TEXT_TURN_TIMEOUT + 5) -> dict:
+    async def ask(self, text: str, timeout: float = TEXT_TURN_TIMEOUT + 5, *,
+                  announce: bool = False) -> dict:
         """Send a typed request; returns {"text": ..., "error": ...}.
 
         The agent answers through its normal session with audio output off, so
-        this is silent — it is how JARVIS is used in quiet mode.
+        this is silent — it is how JARVIS is used in quiet mode. `announce` is
+        for a line to say rather than a thing to do: spoken aloud, no tools.
         """
         loop = asyncio.get_running_loop()
         self._text_seq += 1
         request_id = f"t{self._text_seq}"
         future: asyncio.Future = loop.create_future()
         self._text_waiters[request_id] = (loop, future)
-        payload = json.dumps({"id": request_id, "text": text})
+        payload = json.dumps({"id": request_id, "text": text, "announce": announce})
         if not self._send(f"TEXT {payload}"):
             self._text_waiters.pop(request_id, None)
             return {"text": "", "error": "agent is not running"}
@@ -1206,7 +1208,9 @@ async def launcher_loop():
 
     # ---- Cross-OS handoff: tasks the other OS left for this one -------------
     # Off the wake path: the queue is a network call, and the laptop may have
-    # only just joined Wi-Fi. Each task runs as a silent typed request.
+    # only just joined Wi-Fi. Each task runs as a silent typed request, and is
+    # then confirmed: spoken ("Welcome back to Windows, sir. Opened up FRC mode
+    # for you."), or as a notification in quiet mode.
     async def _run_handoff_tasks():
         loop = asyncio.get_running_loop()
         try:
@@ -1215,7 +1219,7 @@ async def launcher_loop():
             logger.info("Handoff check skipped: %s", e)
             return
         queue = handoff.get_queue()
-        for task in tasks:
+        for index, task in enumerate(tasks):
             logger.info("Handoff from %s: %r", task.created_on, task.request)
             plat.notify(f"Picking up from {task.created_on.capitalize()}", task.request)
             reply = await agent.ask(task.request)
@@ -1228,6 +1232,13 @@ async def launcher_loop():
             except Exception as e:
                 logger.warning("Could not mark handoff task done: %s", e)
             logger.info("Handoff %s: %s", "failed" if failed else "done", outcome)
+            if await loop.run_in_executor(None, quiet.is_quiet):
+                plat.notify("JARVIS", str(outcome))
+            else:
+                said = await agent.ask(handoff.pickup_confirmation(
+                    task, str(outcome), greet=index == 0), announce=True)
+                logger.info("Handoff confirmation: %s",
+                            said.get("text") or said.get("error"))
             if state != State.ACTIVE:
                 overlay.hide()
 
