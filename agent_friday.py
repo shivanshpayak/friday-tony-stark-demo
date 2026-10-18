@@ -15,6 +15,7 @@ import os
 import re
 import random
 import sys
+from datetime import datetime
 
 import numpy as np
 
@@ -159,7 +160,7 @@ from pathlib import Path
 
 from livekit import rtc
 from livekit.agents import (
-    JobContext, WorkerOptions, cli,
+    APIError, APITimeoutError, JobContext, ModelSettings, StopResponse, WorkerOptions, cli,
     llm as lk_llm, stt, TurnHandlingOptions,
 )
 from livekit.agents.voice import Agent, AgentSession
@@ -170,14 +171,19 @@ from friday.webrtc_vad import WebRTCVAD
 from friday.config import (
     SYSTEM_PROMPT, DISMISSAL_PHRASES, SLEEP_RESPONSES, READY_RESPONSES,
     STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER,
-    MAX_HISTORY_ITEMS, SESSION_SPEAKER_GATE_MAX_REJECTS, logger,
+    MAX_HISTORY_ITEMS, SESSION_SPEAKER_GATE_MAX_REJECTS, LLM_MAX_RETRY, logger,
+    TTS_FIRST_AUDIO_TIMEOUT, STT_WORD_SILENCE_END,
     RECOVERY_LINE_INSTRUCTIONS, PREPARE_WAIT_TIMEOUT, TEXT_TURN_TIMEOUT,
 )
 from friday.providers import (
     build_stt, build_llm, build_tts, build_session_conn_options, tts_voice_id,
 )
 from friday.voice_cache import PrerenderedLines, audio_stream
+from friday.tts_trim import trim_edge_silence
+from friday.turn_end import end_turn_on_words
 from friday.routing import LocalDomainToolPool
+from friday import focus
+from friday.small_talk import is_small_talk
 from friday.speaker_gate import get_speaker_gate
 from friday.mic_filter import HumFilter
 from friday.recovery import is_fatal_close
@@ -270,6 +276,107 @@ def _is_dismissal(text: str) -> bool:
     return any(f" {phrase} " in padded for phrase in _DISMISSAL_NORMALIZED)
 
 
+def _ends_with_tool_result(chat_ctx) -> bool:
+    """True when the completion being requested follows a tool's output."""
+    items = getattr(chat_ctx, "items", None)
+    return bool(items) and getattr(items[-1], "type", "") == "function_call_output"
+
+
+def _scheduled_fire_instructions(item) -> str:
+    """What to say when a timer or reminder goes off. A focus session's end
+    (friday/focus.py) ends the session and gets a recap built from what actually
+    happened, in his own words, instead of the stored line."""
+    if item.label == focus.TIMER_LABEL:
+        record = focus.finish()
+        if record:
+            facts = focus.recap(record, focus.notification_count())
+            return ("His focus session just ended. Tell him in one or two short, dry "
+                    f"sentences, in your own words, then stop: {facts}")
+    return (f"A scheduled {item.kind} just went off. "
+            f"Speak this to the user verbatim, then stop: '{item.message}'")
+
+
+def _is_small_talk_turn(chat_ctx) -> bool:
+    """True when the completion answers a casual line of his (friday/small_talk.py),
+    not a tool result or an instruction."""
+    items = getattr(chat_ctx, "items", None)
+    if not items:
+        return False
+    last = items[-1]
+    return (getattr(last, "type", "") == "message" and getattr(last, "role", "") == "user"
+            and is_small_talk(last.text_content or ""))
+
+
+def _just_this_line(chat_ctx):
+    """The instructions and his latest line, without the conversation before it.
+
+    For small talk only. One machine-flavoured reply ("the systems are humming")
+    got echoed by the next ones: over whole casual conversations 44% of replies
+    slipped with the history, 38% with just the last exchange, 13% without it.
+    """
+    items = list(chat_ctx.items)
+    system = [item for item in items if getattr(item, "role", None) == "system"]
+    return lk_llm.ChatContext(system + items[-1:])
+
+
+def _with_time(chat_ctx, now: datetime | None = None):
+    """The chat context for one completion, with the current date and time as
+    a bracketed note at the head of his latest line.
+
+    A copy each time, so it neither piles up in the history nor gets trimmed
+    away by MAX_HISTORY_ITEMS. Without it the model guessed: "just another
+    Tuesday" on a Sunday, "I trust your morning" at 2 a.m.
+
+    Not in the system instructions: Gemini sends those ahead of the ~70 tool
+    definitions, and a note there that changes every minute cost the prompt
+    cache — measured, 60-100 ms more before the first word of a command. In
+    his line it comes after everything cacheable. (Example exchanges were
+    tried as well, for casual talk, and measured worse.)
+    """
+    items = list(chat_ctx.items)
+    for at in range(len(items) - 1, -1, -1):
+        line = items[at]
+        if getattr(line, "type", "") == "message" and getattr(line, "role", "") == "user":
+            break
+    else:
+        return chat_ctx
+    now = now or datetime.now().astimezone()
+    clock = now.strftime("%I:%M %p").lstrip("0")
+    note = (f"[Right now it is {now:%A}, {now:%B} {now.day}, {now.year}, {clock} his time. "
+            "Bring it up only when it matters.]")
+    items[at] = line.model_copy(update={"content": [note, *line.content]})
+    return lk_llm.ChatContext(items)
+
+
+async def _first_within(frames, timeout: float):
+    """Pass `frames` through, failing if the first one takes over `timeout`.
+
+    The TTS stream's own deadline has to be long enough for a whole reply
+    (TTS_STREAM_TIMEOUT), so it no longer notices a synthesis that never
+    starts. Once audio is flowing there is no limit here.
+    """
+    iterator = frames.__aiter__()
+    try:
+        try:
+            first = await asyncio.wait_for(iterator.__anext__(), timeout)
+        except StopAsyncIteration:
+            return                      # nothing to say (e.g. a tool-only turn)
+        except asyncio.TimeoutError:
+            raise APITimeoutError(f"no speech audio after {timeout:.0f}s") from None
+        yield first
+        async for frame in iterator:
+            yield frame
+    finally:
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+def _is_empty_completion(exc: Exception) -> bool:
+    """The livekit Gemini plugin's error for a completion with no content."""
+    return "no response generated" in str(getattr(exc, "message", "") or exc)
+
+
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
@@ -278,6 +385,10 @@ class FridayAgent(Agent):
     """F.R.I.D.A.Y. voice agent. Tools come from the local MCP server
     (see server.py + friday/tools/). This class keeps voice-specific
     concerns: speaker gating, history trimming, streaming signals, greeting."""
+
+    # Pre-rendered SLEEP_RESPONSES (a PrerenderedLines), set by the entrypoint
+    # once they are loaded; until then a dismissal is synthesised live.
+    signoff_lines = None
 
     def __init__(self, stt, llm, tts, vad=None) -> None:
         from friday.tools.memory import get_memories_prompt
@@ -346,8 +457,15 @@ class FridayAgent(Agent):
             finally:
                 alarm_task.cancel()
 
+        def _transcribe(frames):
+            events = Agent.default.stt_node(self, frames, model_settings)
+            if _stt_ends_turns():
+                # Fan noise never lets Deepgram hear the end of a turn.
+                events = end_turn_on_words(events, STT_WORD_SILENCE_END)
+            return events
+
         if not gate.enabled or self._gate_fail_open:
-            async for ev in Agent.default.stt_node(self, _probed(audio), model_settings):
+            async for ev in _transcribe(_probed(audio)):
                 if (
                     isinstance(ev, stt.SpeechEvent)
                     and ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT
@@ -370,7 +488,7 @@ class FridayAgent(Agent):
                 sample_rate = frame.sample_rate
                 yield frame
 
-        async for ev in Agent.default.stt_node(self, _buffered_audio(), model_settings):
+        async for ev in _transcribe(_buffered_audio()):
             if not isinstance(ev, stt.SpeechEvent):
                 yield ev
                 continue
@@ -395,7 +513,7 @@ class FridayAgent(Agent):
                 pcm = np.concatenate(
                     [np.frombuffer(f.data, dtype=np.int16) for f in audio_buf]
                 )
-                # gate.verify runs Resemblyzer's neural embedding extraction
+                # gate.verify runs the neural embedding extraction
                 # which can take hundreds of ms. Pushing it to a thread keeps
                 # the asyncio event loop free to log frames, fire watchdogs,
                 # and process the next batch of audio.
@@ -434,6 +552,15 @@ class FridayAgent(Agent):
         """
         if MAX_HISTORY_ITEMS and len(chat_ctx.items) > MAX_HISTORY_ITEMS:
             chat_ctx = chat_ctx.truncate(max_items=MAX_HISTORY_ITEMS)
+        if _is_small_talk_turn(chat_ctx):
+            # Small talk (friday/small_talk.py) goes without tools and without the
+            # earlier conversation: with either attached Gemini answered "How you
+            # doing, baby?" like a status readout. tool_choice goes to "none" too —
+            # Gemini rejects any other choice without function declarations.
+            chat_ctx = _just_this_line(chat_ctx)
+            tools = []
+            model_settings = ModelSettings(tool_choice="none")
+        chat_ctx = _with_time(chat_ctx)
 
         # Signal the launcher that we're thinking
         print("PROCESSING", flush=True)
@@ -444,7 +571,7 @@ class FridayAgent(Agent):
         called_tool = False
 
         try:
-            async for chunk in Agent.default.llm_node(self, chat_ctx, tools, model_settings):
+            async for chunk in self._complete(chat_ctx, tools, model_settings):
                 if (
                     isinstance(chunk, lk_llm.ChatChunk)
                     and chunk.delta is not None
@@ -491,6 +618,75 @@ class FridayAgent(Agent):
             # cleared it before.
             if first_content and not called_tool:
                 print("TURN_IDLE", flush=True)
+
+    async def _complete(self, chat_ctx, tools, model_settings):
+        """One LLM completion, with an empty reply treated as silence.
+
+        Gemini sometimes ends a completion with no text and no tool call. The
+        livekit plugin raises that as an error, and with livekit doing the
+        retrying, a model that simply had nothing to say cost a second call and
+        then an exception — a few of which in a row close the session. In the
+        logs that was most turns after a successful action (where the prompt
+        asks for silence) and stray half-sentences picked up by the mic.
+
+        So livekit's own LLM retries are off (build_session_conn_options) and
+        the policy lives here: after a tool result an empty reply simply ends
+        the turn; otherwise it is retried LLM_MAX_RETRY times, in case it was a
+        real request, and then ends the turn quietly. Network errors keep
+        their retry and still raise when it runs out.
+        """
+        after_tool = _ends_with_tool_result(chat_ctx)
+        for attempt in range(LLM_MAX_RETRY + 1):
+            produced = False
+            try:
+                async for chunk in Agent.default.llm_node(
+                        self, chat_ctx, tools, model_settings):
+                    if (isinstance(chunk, lk_llm.ChatChunk) and chunk.delta is not None
+                            and (chunk.delta.content or chunk.delta.tool_calls)):
+                        produced = True
+                    yield chunk
+                return
+            except APIError as e:
+                empty = _is_empty_completion(e)
+                last = attempt == LLM_MAX_RETRY
+                if empty and (after_tool or last):
+                    logger.info("LLM had nothing to say (%s) — ending the turn silently",
+                                "after a tool result" if after_tool else "twice")
+                    return
+                if produced or last or not (empty or e.retryable):
+                    raise
+                logger.warning("LLM attempt %d failed (%s) — retrying", attempt + 1, e)
+                await asyncio.sleep(0.1)
+
+    # -- Dismissal without the LLM ----------------------------------------
+
+    async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        """Answer a dismissal with a fixed sign-off instead of an LLM turn.
+
+        The sign-off used to be the model's reply to "dismissed" — a full LLM
+        and TTS round trip, and the model answered with nothing often enough
+        ("Dismissed." was the commonest empty completion in the logs) that the
+        session then waited out SIGNOFF_START_TIMEOUT before closing. The
+        activation loop still ends the session once the line has played.
+        """
+        if not _is_dismissal(new_message.text_content or ""):
+            return
+        picked = self.signoff_lines.pick() if self.signoff_lines else None
+        if picked is not None:
+            text, frames = picked
+            self.session.say(text, audio=audio_stream(frames))
+        else:
+            self.session.say(random.choice(SLEEP_RESPONSES))
+        raise StopResponse()
+
+    # -- TTS with the provider's padding silence removed -------------------
+
+    async def tts_node(self, text, model_settings):
+        """Speak sooner and hand the mic back sooner (friday/tts_trim.py)."""
+        frames = _first_within(Agent.default.tts_node(self, text, model_settings),
+                               TTS_FIRST_AUDIO_TIMEOUT)
+        async for frame in trim_edge_silence(frames):
+            yield frame
 
     # -- Greeting ---------------------------------------------------------
 
@@ -849,6 +1045,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # with a timeout so a wedged grpc stream can never hold up boot. Until it
     # finishes, activation just falls back to the live generate_reply path.
     ready_lines = PrerenderedLines(tts_voice_id())
+    signoff_lines = PrerenderedLines(tts_voice_id())
 
     async def _warm_ready_lines() -> None:
         try:
@@ -857,6 +1054,11 @@ async def entrypoint(ctx: JobContext) -> None:
             )
             logger.info("Wake lines ready (%d/%d pre-rendered)",
                         count, len(READY_RESPONSES))
+            count = await asyncio.wait_for(
+                signoff_lines.ensure(tts_inst, SLEEP_RESPONSES), timeout=60
+            )
+            logger.info("Sign-off lines ready (%d/%d pre-rendered)",
+                        count, len(SLEEP_RESPONSES))
         except asyncio.TimeoutError:
             logger.warning("Wake line pre-render timed out — using the live path")
         except Exception as e:
@@ -971,10 +1173,7 @@ async def entrypoint(ctx: JobContext) -> None:
         try:
             logger.info("Scheduled %s fired (%s): %s", item.kind, item.id, item.message)
             await session.generate_reply(
-                instructions=(
-                    f"A scheduled {item.kind} just went off. "
-                    f"Speak this to the user verbatim, then stop: '{item.message}'"
-                ),
+                instructions=await asyncio.to_thread(_scheduled_fire_instructions, item),
                 tool_choice="none",
             )
         except Exception as e:
@@ -1138,6 +1337,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # lets the console audio backlog leak into STT and fire a phantom LLM turn
     # at boot. See _pre_gate_mic.
     voice_agent = FridayAgent(stt=stt_inst, llm=llm_inst, tts=tts_inst)
+    voice_agent.signoff_lines = signoff_lines
     _pre_gate_mic(session)
     _mic_enabled = False
     await session.start(

@@ -18,7 +18,7 @@ agent; the agent runs one LiveKit voice session and talks to a local MCP tool se
 flowchart TB
     subgraph P1["friday_launcher.py  (supervisor)"]
         WW["Wake-word loop<br/>(openWakeWord)"]
-        SV["Speaker verify<br/>(Resemblyzer)"]
+        SV["Speaker verify<br/>(numpy LSTM encoder)"]
         FP["Fast path<br/>(Vosk closed grammar)<br/>mute · play · next · …"]
         OV["Fullscreen overlay"]
         HK["Global hotkeys<br/>PTT / kill / restart"]
@@ -70,9 +70,9 @@ sequenceDiagram
     participant S as MCP server
     L->>L: disable power throttling, start overlay
     L->>A: spawn agent_friday.py console FIRST (stdin/stdout pipes)
-    Note over L: while the agent boots: load wake-word model (openwakeword,<br/>~12s cold import), speaker verifier, Vosk fast path; arm hotkeys
+    Note over L: while the agent boots: load wake-word model (openwakeword),<br/>speaker verifier, Vosk fast path; arm hotkeys
     Note over A: apply Windows net patches (IPv4-only, sequential connect)<br/>+ force console APM OFF  (module import, before livekit)
-    A->>A: warm providers (STT/LLM/TTS) + speaker gate (parallel;<br/>gate skips Resemblyzer entirely while disabled)
+    A->>A: warm providers (STT/LLM/TTS) + speaker gate (parallel;<br/>gate skips the encoder entirely while disabled)
     A->>A: pre-warm Google TTS grpc channel (list_voices)  ← avoids first-call hang
     A->>A: pre-render wake lines (background; disk cache, ~20ms warm)
     A->>S: spawn server.py, register core toolset
@@ -145,11 +145,12 @@ stateDiagram-v2
 - **Silent-mic false wakes** are dropped before verification: openwakeword
   occasionally fires on a near-silent mic, and a wake buffer that never peaks above
   `WAKE_SILENCE_PEAK` is ignored without flashing the overlay or sending `PREPARE`
-  (Resemblyzer scores such audio ≤ 0.63, so verification would reject it anyway).
+  (the speaker encoder scores such audio ≤ 0.63, so verification would reject it anyway).
 - **Dismissal** is matched case- and punctuation-insensitively, as whole words
   (`_is_dismissal`), so Deepgram's "Goodbye, Jarvis." hits `goodbye jarvis` while
-  "understand download" does not hit `stand down`. The session then ends when the
-  sign-off has **finished playing** (`agent_state_changed` speaking → not speaking,
+  "understand download" does not hit `stand down`. The sign-off is a pre-rendered
+  `SLEEP_RESPONSES` line, played without an LLM turn (`on_user_turn_completed`).
+  The session then ends when the sign-off has **finished playing** (`agent_state_changed` speaking → not speaking,
   via `_wait_for_signoff`; capped at `SIGNOFF_START_TIMEOUT` 5s to start and
   `SIGNOFF_MAX_SPEECH` 10s to play) instead of after a fixed 6s, so the wake word is
   back as soon as JARVIS stops talking.
@@ -166,7 +167,7 @@ TTS — ~0.4 s versus ~5–7 s through the normal path.
 flowchart TB
     WD["Wake word detected"] --> PREP["send PREPARE to agent<br/>(silent prep, overlapping)"]
     WD --> SNAP["snapshot ring buffer"]
-    SNAP --> VER["Speaker verify<br/>(Resemblyzer)"]
+    SNAP --> VER["Speaker verify<br/>(numpy LSTM encoder)"]
     WD --> CAP["TailRecognizer.capture_and_match()<br/>webrtcvad endpoint + streaming Vosk"]
     VER --> GATE{"verified?"}
     CAP --> GATE
@@ -291,6 +292,10 @@ selected at import time — nothing on the latency path changed.
 | Speaker fingerprint | `voice_embedding.windows.npy` | `voice_embedding.linux.npy` | `plat.voice_embedding_path`, `enroll_voice.py` |
 | PTT / restart / kill | global hotkeys (`keyboard`) | signals SIGUSR2 / SIGHUP / SIGTERM (not SIGUSR1 — the PipeWire client blocks it) via `friday_ctl` + `runtime/friday.pid` | `friday_launcher.py`, `friday_ctl.py` |
 | Overlay | Tk + Win32 layered windows | Qt subprocess `friday_overlay_qt.py`, fed state names over stdin | `friday_overlay.py` |
+| Desktop reacts to JARVIS | — | the same overlay states as a read-only long poll, `GET http://127.0.0.1:47811/state?after=<seq>`, read by the Event Horizon wallpaper (`~/event-horizon`) | `friday/state_feed.py`, `_SubprocessOverlay._send` |
+| Wallpaper pulses to music | — | subprocess reads the default output's monitor (`parec`) only while asked, finds bass onsets, long poll `GET http://127.0.0.1:47812/music?after=<beat>` | `friday/music_pulse.py`, `_SubprocessOverlay.start` |
+| Wallpaper sky: timers, tasks, notifications | — | subprocess watches `runtime/scheduled.json`, `runtime/tasks/active/`, and Notify calls (`dbus-monitor --profile`, no contents); long poll `GET http://127.0.0.1:47813/sky?after=<seq>` | `friday/sky_feed.py`, `_SubprocessOverlay.start` |
+| Focus mode | — | `start_focus` / `end_focus`: closes `FOCUS_CLOSE_APPS`, pauses every MPRIS player, plays `FOCUS_PLAYLIST`, writes `runtime/focus.json` + a `focus` timer; the sky feed holds KDE's notification inhibition while it's on (auto-lifted if the feed dies); the timer's fire speaks a recap | `friday/focus.py`, `friday/tools/focus.py`, `agent_friday._scheduled_fire_instructions` |
 | Autostart / relaunch | Task Scheduler, `start_friday.vbs` | `~/.config/autostart/jarvis.desktop`, `start_friday.sh` | `install_startup.py` |
 | Reboot into the other OS | elevated Task Scheduler task `JARVIS Restart into Linux` (UEFI one-shot via `bcdedit`, then restart) | root helper `boot-windows-next` (UEFI one-shot via `efibootmgr`) + KDE logout | `plat.restart_into`, `install_boot_switch.py`, `boot-switch/` |
 
@@ -312,8 +317,6 @@ Linux gotchas:
   seconds of painting.
 - **`read_long_content` can't scroll on Wayland** unless `ydotool` is installed —
   input injection needs uinput. `read_screen` is unaffected.
-- **torch is the CPU build on Linux** (`[tool.uv.sources]`): PyPI's default wheel
-  drags in several GB of CUDA libraries for a 2.5s speaker embedding.
 - **The FRC Driver Station is Windows-only**; other dashboards launch from the
   WPILib `.desktop` entries.
 - **One speaker fingerprint per OS.** Both installs share this repo through git,
@@ -323,11 +326,16 @@ Linux gotchas:
   so run `enroll_voice.py` once on each OS. On Windows it finds the running
   launcher by command line (no PID file there) to stop and restart it.
 - **Fingerprint clips are cleaned first** (`friday/voiceprint.py`). The 2.5s
-  behind a wake word is ~1s of "Hey Jarvis" and the rest room noise; embedded
-  raw, a different room or mic distance pushed the owner to 0.55–0.66 and the
-  wake word was ignored. Silence is cut (webrtcvad) and volume levelled before
-  embedding — in the wake gate, the in-session gate and enrollment alike, so
-  re-enroll after changing it. Wake threshold is 0.65.
+  behind a wake word is ~1s of "Hey Jarvis" and the rest is the room and the mic.
+  Three steps, the same in the wake gate, the in-session gate and enrollment (so
+  re-enroll after changing any): **high-pass at 300 Hz**, cut the silence
+  (webrtcvad), level the volume. The high-pass is the important one: this mic
+  carries a rumble below 70 Hz as loud as quiet speech, plus a 120 Hz hum while
+  charging, and both ended up in the fingerprint — two enrollments of the same
+  person a day apart matched at only 0.68 and the owner passed ~1 wake in 10.
+  Wake threshold is 0.65. `enroll_voice.py` keeps its raw samples in
+  `runtime/voice_enroll/`, and the launcher keeps the last 40 wake clips with
+  their scores in `runtime/wake_clips/` (both untracked) for diagnosis.
 - **Deepgram ends the user's turn, not the local VAD** (`_stt_ends_turns` in
   `agent_friday.py`; `turn_detection="stt"`, Deepgram `endpointing_ms=300`, no
   VAD on the agent). The WebRTC VAD hears steady mic noise as speech: a 120 Hz
@@ -506,9 +514,15 @@ understanding why** — each cost a long debugging trail.
 | **Google TTS grpc channel warmup** | pre-warm block after providers | grpc establishes the HTTP/2 connection lazily on first synthesis, under session load, and hangs. Warming `list_voices()` at boot connects it early. |
 | **Console APM forced OFF** | `_force_console_apm_off` | livekit's console `AudioProcessingModule` (AEC+NS+AGC) stripped the user's voice to the noise floor → STT got silence → no transcripts. Escape hatch: `FRIDAY_KEEP_APM=1`. |
 | **Echo guard** | `discard_audio_if_uninterruptible=True` | With APM + speaker gate off, prevents transcribing the agent's own TTS. |
-| **Resemblyzer warmed at boot** | `SpeakerVerifier.warm` (friday_launcher.py) | The first `embed_utterance()` call JIT-compiles librosa/numba and takes **~4.6s**; every call after is ~20ms. The first wake word after every boot therefore stalled ~5s inside speaker verification — long enough to blow past the agent's `PREPARE_WAIT_TIMEOUT` and abort the activation. Warmed on a background thread during boot, where it overlaps the agent's cold start. Encoder use is lock-guarded so warmup can't race a wake word. |
+| **Turns start and end on words, not sound** | `friday/turn_end.py` — wrapped around the STT events in `FridayAgent.stt_node`; `STT_WORD_SILENCE_END` (config) | Deepgram's endpoint (`speech_final`) needs 300ms of silence and its `SpeechStarted` comes from an audio VAD. A fan is steady noise: the silence never came, so a finished request sat unanswered until the mic was muted, and a noise-triggered `START_OF_SPEECH` right after a turn ended cancelled the pending reply. The wrapper drops Deepgram's start events and emits `START_OF_SPEECH` at the first transcript with text; it ends the turn at Deepgram's endpoint *or* once the transcript has gone 1.0s without changing, whichever is first. Under noise Deepgram also withholds the *final* transcript for seconds, so a stable interim is promoted to final and Deepgram's late final for the same words is dropped. Measured against Deepgram with fan-like noise: turn ended 0.7s after the last word, versus never. Quiet-room timing is unchanged. |
+| **A spoken reply gets time to finish** | `TTS_STREAM_TIMEOUT` / `TTS_FIRST_AUDIO_TIMEOUT` (config) → `build_session_conn_options`, `_first_within` (agent_friday.py) | livekit's default 10s TTS timeout is applied by the Google plugin as the deadline for the *whole* streaming call, so any reply that took over ~10s to synthesise was cut off mid-sentence, followed by retries that could only fail ("no audio frames were pushed" — the text was already consumed) and an error counted toward closing the session. The stream now has 180s; a TTS that never starts is caught by a 15s wait for the first audio only; TTS retries are off. |
+| **TTS padding silence is cut** | `friday/tts_trim.py` — `FridayAgent.tts_node` (live replies), `PrerenderedLines.ensure` (wake lines) | Gemini TTS pads every utterance with 160–210ms of silence before the first word and 390–480ms after the last. The mic is closed while the agent speaks and, after a wake, opens only when the ready line ends — so that padding was dead air before the user could talk. Both ends are cut (20ms lead / 150ms tail kept; pauses inside a reply untouched): ~0.4s off every wake→listening, replies audible ~0.15s sooner, mic back ~0.25s sooner. The 150ms tail is deliberate — it covers the sound card draining its buffer, so the agent doesn't hear its own last word. |
+| **Speaker encoder is plain numpy** | `friday/voice_encoder.py` (+ `voice_encoder.npz`) | Resemblyzer's network is a 3-layer LSTM, but importing it loaded torch, librosa, numba and llvmlite: **~265 MB** resident in the launcher and a ~4.6s JIT on the first embedding (which once stalled the first wake word past `PREPARE_WAIT_TIMEOUT`). The same weights now run in numpy — identical embeddings (so enrolled fingerprints stay valid), ~20ms per clip, no warmup. `tests/test_voice_encoder.py` pins the output to a Resemblyzer reference. |
+| **openwakeword's training import is stubbed** | `_skip_openwakeword_training_imports` (friday_launcher.py) | `import openwakeword` pulls in its verifier-training module, and with it scipy + sklearn (~65 MB, most of the import time), which detection never uses. A stand-in module is registered first. |
 | **Stray `GREET` must not shut the agent down** | `_normalize_activation_cmd` (agent_friday.py) | If a `PREPARE` handshake times out, the agent returns to the outer activation wait. A `GREET` landing there was unrecognised and hit the shutdown branch — killing the live session. Only `QUIT`/`FATAL`/EOF may shut down; a late `GREET` is honoured as a full `START` (the launcher is blocked in `wait_session_done()` and would otherwise hang). Guarded by `tests/test_activation_protocol.py`. |
-| **Bounded LLM retries** | `LLM_MAX_RETRY` (config) → `build_session_conn_options` | Gemini returns an *empty* completion when the prompt asks for silence (after a plainly successful action); the livekit google plugin raises that as a retryable `no response generated`. At livekit's default (3 retries, 2s apart) each silent turn was ~6s of dead air with the mic deaf (interruptions are off). One immediate retry keeps network-blip cover. |
+| **An empty LLM reply is silence, not an error** | `FridayAgent._complete` (agent_friday.py), `LLM_MAX_RETRY` (config), `build_session_conn_options` | Gemini sometimes ends a completion with no text and no tool call, and the livekit google plugin raises that as a retryable error. livekit's own LLM retries are therefore off (`max_retry=0`) and the agent decides: after a tool result an empty reply just ends the turn (no second call); after a user turn it is retried once in case it was a real request, then the turn ends quietly instead of raising (a few raised failures in a row close the session). Network errors still retry and raise. |
+| **Thinking is off on the voice path** | `FAST_THINKING_BUDGET = 0` (config) → `build_llm` | With thinking on, `gemini-2.5-flash` answered plain action requests with an empty completion: 25 of 72 at budget 256, none at 0, and first token at ~1.0s vs ~0.6s (`diag_llm.py`, real prompt + 69 tools; the logs showed about a quarter of real turns hitting it). `build_llm` always sends the budget explicitly — an unset `thinking_config` is *dynamic* thinking, the worst setting, which is what "0" silently meant before. |
+| **Dismissal skips the LLM** | `FridayAgent.on_user_turn_completed`, `SLEEP_RESPONSES` (config) | The sign-off was the model's reply to "dismissed" — an LLM + TTS round trip, and the commonest empty completion in the logs, after which the session waited out `SIGNOFF_START_TIMEOUT` in silence. A dismissal now plays one of `SLEEP_RESPONSES`, pre-rendered at boot like the wake lines, and raises `StopResponse` so no LLM turn runs. |
 | **Never `taskkill` explorer.exe or python** | `close_app` (friday/tools/apps.py) | `explorer.exe` hosts File Explorer windows **and** the Windows shell (taskbar, Start menu, Alt+Tab): "close File Explorer" ran `taskkill /F /IM explorer.exe` and took the desktop down. File Explorer is now closed window-by-window (`WM_CLOSE` to `CabinetWClass` windows); `python.exe`/`pythonw.exe` (JARVIS itself) are refused; the PowerShell title-match fallback filters protected processes before matching. Guarded by `tests/test_close_app.py`. |
 | **Restart hotkey needs `start_friday.vbs`** | `_spawn_relaunch` (friday_launcher.py) | The restart hotkey and the Windows Startup shortcut both run `start_friday.vbs`. `wscript.exe` "succeeds" on a missing script, so the hotkey used to kill JARVIS and spawn nothing; it now refuses to restart when the script is missing. |
 | **Mic gated BEFORE `session.start()`** | `_pre_gate_mic` (agent_friday.py) | `ConsoleAudioInput` is *attached by default* and queues mic frames into an unbounded channel from the moment `start()` creates it; `AgentSession._forward_audio_task` drains that channel without ever checking `input.audio_enabled`. Gating *after* start therefore still leaked the captured backlog into Deepgram, which endpointed the burst into a hallucinated `"Mhmm."` and fired a full LLM turn (4 failing Gemini calls) at every boot. Gating first makes the `AgentInput.audio` setter call `on_detached()` at assignment, so frames are dropped at the source. Guarded by `tests/test_audio_gate_ordering.py`. |
@@ -598,6 +612,10 @@ switch cancel them. Generalizes the hardcoded `monitor_wifi_connection` loop.
 | Config (providers, prompt, thresholds, flags) | `friday/config.py` |
 | Session recovery helpers | `friday/recovery.py` |
 | Speaker gate (in-session verification) | `friday/speaker_gate.py` |
+| Speaker encoder (numpy LSTM + weights) | `friday/voice_encoder.py`, `friday/voice_encoder.npz` |
+| TTS silence trimming | `friday/tts_trim.py` |
+| System prompt (CHARACTER / OPINIONS / SPEECH / ACTIONS) | `SYSTEM_PROMPT` in `friday/config.py` |
+| LLM model / thinking / prompt eval (live path, no tools run) | `diag_llm.py` |
 | Pre-rendered wake lines (no LLM/TTS on wake) | `friday/voice_cache.py` → `runtime/voice_cache/*.wav` |
 | Fast-path voice commands (launcher, no LLM) | `friday/fastpath/` — command table in `registry.py` |
 | Shared media control (volume, mute, transport) | `friday/media_control.py` |

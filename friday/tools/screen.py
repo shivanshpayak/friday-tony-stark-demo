@@ -225,7 +225,7 @@ def register(mcp: FastMCP):
         capturing as it goes, then answers your prompt over ALL of it (it will NOT
         read a huge list aloud — it summarizes / answers). Slower than read_screen
         (a few seconds) and it visibly scrolls the window, so say a short line
-        first (ACTING OUT LOUD). Use for "read this whole list", "how many X are
+        first. Use for "read this whole list", "how many X are
         here", "is Y in this", "what's in this playlist" — anything longer than one
         screen. For a single visible screen, use read_screen instead."""
         return await asyncio.get_event_loop().run_in_executor(

@@ -39,7 +39,7 @@ def register(mcp: FastMCP):
 
         Use for "keep doing X until Y" / "retry until it works" requests, e.g.
         "keep reconnecting my wifi until I'm online". First say one short line
-        about what you're about to do (ACTING OUT LOUD), THEN call this.
+        about what you're about to do, THEN call this.
 
         - `action` / `check`: names from list_loop_capabilities.
         - `goal`: a short human phrase used for the spoken update, e.g.

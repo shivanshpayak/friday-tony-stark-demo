@@ -63,6 +63,38 @@ def _mpris_call(method: str) -> bool:
     return True
 
 
+def _playing(name: str) -> bool:
+    try:
+        return '"Playing"' in _run(["busctl", "--user", "get-property", name, _MPRIS_PATH,
+                                    _MPRIS_PLAYER, "PlaybackStatus"])
+    except Exception:
+        return False
+
+
+def pause_everything() -> int:
+    """Pause every player that's playing — a YouTube tab, Spotify, anything. How many."""
+    if _WIN:
+        return 0
+    paused = 0
+    for name in _mpris_players():
+        if _playing(name):
+            _run(["busctl", "--user", "call", name, _MPRIS_PATH, _MPRIS_PLAYER, "Pause"])
+            paused += 1
+    return paused
+
+
+def play_player(hint: str) -> bool:
+    """Press Play on the player whose bus name contains `hint` ("spotify").
+    True once it reports Playing."""
+    if _WIN:
+        return False
+    for name in _mpris_players():
+        if hint in name.lower():
+            _run(["busctl", "--user", "call", name, _MPRIS_PATH, _MPRIS_PLAYER, "Play"])
+            return _playing(name)
+    return False
+
+
 def now_playing(player_hint: str = "") -> str | None:
     """'Artist - Title' from MPRIS metadata, or None when nothing is loaded.
 

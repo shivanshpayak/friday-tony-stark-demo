@@ -212,9 +212,9 @@ def register(mcp):
     @mcp.tool()
     def open_on_screen(target: str, kind: str = "auto") -> str:
         """Open/"pull up" something in front of the user: a web URL, a Google
-        search, or a local file/folder. Use for "pull up X", "open X", "show me X
-        on screen", "google X and open it". First say a short line (ACTING OUT
-        LOUD), then call this.
+        search, or a local file/folder. Use for "pull up X", "open X", "show me X",
+        "show me a picture of X" (kind "search"), "google X and open it". First
+        say a short line about what you're opening, then call this.
 
         kind: "auto" (default), "url", "search", or "file".
         - url: opens the target URL in the default browser.

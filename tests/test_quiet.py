@@ -1,4 +1,6 @@
 """Quiet mode: JARVIS must never speak on a school network unless told to."""
+import types
+
 import pytest
 
 from friday import quiet
@@ -62,3 +64,18 @@ def test_offline_is_never_mistaken_for_school(wifi):
 def test_corrupt_state_file_fails_open_to_normal(wifi):
     quiet.STATE_FILE.write_text("{not json", encoding="utf-8")
     assert quiet.is_quiet() is False
+
+
+def test_network_lookup_never_starts_a_wifi_scan(monkeypatch):
+    # A scan takes 3 s+, the lookup timed out, and "" meant "not at school".
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return types.SimpleNamespace(stdout="no:Neighbour\nyes:School\\:WiFi\n")
+
+    monkeypatch.setattr(quiet, "_ssid_cache", (0.0, ""))     # restored afterwards
+    monkeypatch.setattr(quiet.shutil, "which", lambda name: "/usr/bin/nmcli")
+    monkeypatch.setattr(quiet.subprocess, "run", fake_run)
+    assert quiet.current_ssid(fresh=True) == "School:WiFi"
+    assert calls[0][-2:] == ["--rescan", "no"]

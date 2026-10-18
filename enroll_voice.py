@@ -37,12 +37,15 @@ import numpy as np
 import pyaudio
 
 from friday import plat
-from friday.voiceprint import clean_clip
+from friday.voiceprint import clean_clip, save_clip
 
 ROOT = Path(__file__).parent
 OUTPUT_PATH = plat.voice_embedding_path()   # this OS's fingerprint
 BACKUP_PATH = OUTPUT_PATH.with_name(OUTPUT_PATH.stem + ".previous.npy")
 PID_FILE = ROOT / "runtime" / "friday.pid"
+# The raw samples are kept (untracked, this machine only) so the fingerprint
+# can be rebuilt or examined later without saying "Hey Jarvis" ten more times.
+CLIPS_DIR = ROOT / "runtime" / "voice_enroll" / OUTPUT_PATH.stem
 
 # These mirror friday_launcher.py — the clips must be captured the way the
 # launcher captures them, or the enrollment stops matching what it verifies.
@@ -195,10 +198,13 @@ def main():
     try:
         clips = _capture_wake_clips(SAMPLES)
 
+        for i, clip in enumerate(clips):
+            save_clip(CLIPS_DIR / f"{i:02d}.wav", clip)
+
         print()
         print("  computing voice fingerprint...")
-        from resemblyzer import VoiceEncoder
-        encoder = VoiceEncoder(verbose=False)
+        from friday.voice_encoder import VoiceEncoder
+        encoder = VoiceEncoder()
         embeddings = [_unit(encoder.embed_utterance(clean_clip(clip))) for clip in clips]
         fingerprint = _unit(np.mean(embeddings, axis=0))
 

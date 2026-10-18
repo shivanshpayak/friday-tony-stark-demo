@@ -16,7 +16,6 @@ dependencies = [
     "pytest",
     "ddgs",          # web search backend used by search_web tool
     "keyboard; sys_platform == 'win32'",  # global hotkeys (kill switch, restart)
-    "resemblyzer",   # speaker verification
     "google-api-python-client>=2.0.0",
     "google-auth-httplib2>=0.1.0",
     "google-auth-oauthlib>=1.0.0",
@@ -30,10 +29,10 @@ dependencies = [
     "psutil",        # sysmon tool, process checks, tree-kill
     "pillow",        # screen capture for read_screen
     "sounddevice",   # SESSION_MIC selection (also livekit's console audio)
-    "torch",         # resemblyzer backend; pinned to the CPU build on Linux below
     "pyautogui",     # mouse-wheel scroll for read_long_content (scroll-capture)
     "vosk>=0.3.45", # closed-grammar STT for launcher fast-path commands
     "webrtcvad",    # tail endpointing (already used by friday/webrtc_vad.py, was undeclared)
+    "setuptools<81", # webrtcvad imports pkg_resources (it used to arrive with torch)
 ]
 
 [project.scripts]
@@ -48,13 +47,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["server.py"]
-
-# PyPI's Linux torch wheel bundles several GB of CUDA libraries. Resemblyzer
-# only embeds 2.5s clips, so the CPU build is plenty (and is what Windows gets).
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[tool.uv.sources]
-torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]

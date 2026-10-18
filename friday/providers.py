@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 from .config import (
     STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER,
-    GEMINI_LLM_MODEL, OPENAI_LLM_MODEL, GROQ_LLM_MODEL, OLLAMA_LLM_MODEL,
+    GEMINI_LLM_MODEL, GEMINI_TEMPERATURE, OPENAI_LLM_MODEL, GROQ_LLM_MODEL, OLLAMA_LLM_MODEL,
     OPENAI_TTS_MODEL, OPENAI_TTS_VOICE, TTS_SPEED,
     GOOGLE_TTS_MODEL, GOOGLE_TTS_VOICE, GOOGLE_TTS_PROMPT,
     GOOGLE_TTS_VOLUME_GAIN_DB,
@@ -24,7 +24,7 @@ import importlib
 
 from livekit.agents import APIConnectOptions
 from livekit.agents.voice.agent_session import SessionConnectOptions
-from .config import LLM_MAX_RETRY, STT_MAX_RETRY, STT_TIMEOUT
+from .config import STT_MAX_RETRY, STT_TIMEOUT, TTS_STREAM_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +135,11 @@ def build_llm(mode: Literal["fast", "planner"] = "fast"):
         return lk_google.LLM(
             model=GEMINI_LLM_MODEL,
             api_key=os.getenv("GOOGLE_API_KEY"),
-            # Only supply a thinking_config if budget is positive
-            thinking_config={"thinking_budget": budget} if budget > 0 else None,
+            temperature=GEMINI_TEMPERATURE,
+            # Always explicit. Leaving thinking_config unset does NOT turn
+            # thinking off — it selects Gemini's dynamic thinking, the setting
+            # that returned the most empty completions (see FAST_THINKING_BUDGET).
+            thinking_config={"thinking_budget": budget},
         )
     elif LLM_PROVIDER == "groq":
         from livekit.plugins import openai as lk_openai
@@ -234,13 +237,18 @@ def build_session_conn_options() -> SessionConnectOptions:
 
     Widens STT retry/timeout beyond livekit defaults (max_retry=3, timeout=10)
     so a brief blip on the STT path is ridden out instead of closing the session.
-    Narrows LLM retries so an intentionally empty Gemini reply doesn't stall
-    the conversation for ~6s (see LLM_MAX_RETRY).
+    Turns livekit's own LLM retries off: FridayAgent._complete retries itself,
+    because it has to tell an empty Gemini reply (silence, not a failure) from
+    a network error — livekit retried both and then raised (see LLM_MAX_RETRY).
+    Gives a spoken reply time to finish (see TTS_STREAM_TIMEOUT).
     """
     return SessionConnectOptions(
         stt_conn_options=APIConnectOptions(
             max_retry=STT_MAX_RETRY,
             timeout=STT_TIMEOUT,
         ),
-        llm_conn_options=APIConnectOptions(max_retry=LLM_MAX_RETRY),
+        llm_conn_options=APIConnectOptions(max_retry=0),
+        # The timeout is the deadline for a whole spoken reply, not for a
+        # connection attempt — see TTS_STREAM_TIMEOUT.
+        tts_conn_options=APIConnectOptions(max_retry=0, timeout=TTS_STREAM_TIMEOUT),
     )

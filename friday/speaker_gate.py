@@ -1,5 +1,5 @@
 """
-In-session speaker verification using Resemblyzer voice embeddings.
+In-session speaker verification using voice embeddings (friday/voice_encoder.py).
 
 Compares incoming audio against the enrolled voice (this OS's fingerprint —
 see plat.voice_embedding_path).
@@ -17,19 +17,18 @@ from .config import (
 class SessionSpeakerGate:
     """Verifies that incoming audio belongs to the enrolled user.
 
-    Loaded once per process (the Resemblyzer VoiceEncoder is ~50 MB in RAM).
+    Loaded once per process.
     """
 
     def __init__(self) -> None:
         self._encoder = None
         self._reference = None
-        # A disabled gate never verifies anything, so don't pay for Resemblyzer
-        # (torch) at all — it was the slowest step of the agent's boot warmup.
+        # A disabled gate never verifies anything, so don't load the encoder.
         if SESSION_SPEAKER_GATE_ENABLED and VOICE_EMBEDDING_PATH.exists():
             try:
                 self._reference = np.load(VOICE_EMBEDDING_PATH)
-                from resemblyzer import VoiceEncoder
-                self._encoder = VoiceEncoder(verbose=False)
+                from .voice_encoder import VoiceEncoder
+                self._encoder = VoiceEncoder()
                 logger.info("Session speaker gate loaded (threshold=%.2f)",
                             SPEAKER_SIM_THRESHOLD)
             except Exception as e:

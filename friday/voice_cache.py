@@ -12,6 +12,9 @@ runtime/voice_cache/ (keyed by voice + text, so retuning the voice invalidates
 them), and replayed via `session.say(text, audio=...)` — which forwards the
 frames straight to the audio output, skipping both round-trips.
 
+The mic opens when the line ends, so the silence Gemini pads around it is cut
+before replay (friday/tts_trim.py) — about 0.4s off every wake.
+
 Everything here degrades to None/0 on any failure so the caller can fall back
 to the live path. Guarded by tests/test_voice_cache.py.
 """
@@ -27,6 +30,7 @@ from pathlib import Path
 from typing import AsyncIterator, Sequence
 
 from .config import logger
+from .tts_trim import trim_pcm
 
 # Repo-root/runtime/voice_cache. FRIDAY_VOICE_CACHE_DIR lets tests (and the MCP
 # server, which has no business writing here) point somewhere else.
@@ -193,7 +197,11 @@ class PrerenderedLines:
                 cached = (pcm, sample_rate, num_channels)
 
             try:
-                self._frames[text] = to_frames(*cached)
+                # Trimmed here rather than on disk, so the cache keeps what the
+                # TTS produced and a change to the trim needs no re-render.
+                pcm, sample_rate, num_channels = cached
+                self._frames[text] = to_frames(
+                    trim_pcm(pcm, sample_rate, num_channels), sample_rate, num_channels)
             except Exception as e:
                 logger.warning("Voice cache: could not frame %r: %s", text, e)
 

@@ -586,11 +586,23 @@ class _SubprocessOverlay:
     _RENDERER = Path(__file__).parent / "friday_overlay_qt.py"
 
     def __init__(self):
+        from friday.state_feed import StateFeed
+
         self._proc = None
         self._state = OverlayState.SLEEPING
         self._lock = threading.Lock()
+        # The same states, for the desktop wallpaper to react to.
+        self._feed = StateFeed()
+        # Bass hits in whatever is playing, for the wallpaper to pulse to
+        # (friday/music_pulse.py). A subprocess, so its audio analysis stays
+        # out of the wake-word loop's way.
+        self._music = None
+        # Timers, background tasks and notifications, for the wallpaper to put in
+        # orbit (friday/sky_feed.py).
+        self._sky = None
 
     def _send(self, state: OverlayState):
+        self._feed.publish(state.value)
         with self._lock:
             self._state = state
             proc = self._proc
@@ -622,35 +634,43 @@ class _SubprocessOverlay:
             return
         self._send(OverlayState.DISMISSING)
 
+    def _spawn(self, argv, env):
+        try:
+            return subprocess.Popen(
+                argv, cwd=str(self._RENDERER.parent), env=env,
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, text=True,
+            )
+        except Exception:
+            return None
+
     def start(self):
+        self._feed.start()
+        self._music = self._spawn([sys.executable, "-m", "friday.music_pulse"], os.environ.copy())
+        self._sky = self._spawn([sys.executable, "-m", "friday.sky_feed"], os.environ.copy())
         if os.environ.get("FRIDAY_NO_OVERLAY") == "1":
             return
         env = os.environ.copy()
         # XWayland: lets the window sit above everything and ignore input.
         if env.get("DISPLAY"):
             env.setdefault("QT_QPA_PLATFORM", "xcb")
-        try:
-            self._proc = subprocess.Popen(
-                [sys.executable, str(self._RENDERER)],
-                cwd=str(self._RENDERER.parent), env=env,
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, text=True,
-            )
-        except Exception:
-            self._proc = None
+        self._proc = self._spawn([sys.executable, str(self._RENDERER)], env)
 
     def stop(self):
-        proc, self._proc = self._proc, None
-        if proc is None:
-            return
-        try:
-            proc.stdin.close()      # EOF → renderer quits
-            proc.wait(timeout=2)
-        except Exception:
+        self._feed.stop()
+        procs = (self._proc, self._music, self._sky)
+        self._proc = self._music = self._sky = None
+        for proc in procs:
+            if proc is None:
+                continue
             try:
-                proc.kill()
+                proc.stdin.close()      # EOF → the child quits
+                proc.wait(timeout=2)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
 
 
 if not _WIN:

@@ -212,15 +212,16 @@ def test_boot_with_retries_gives_up_after_attempts():
 
 
 def test_session_conn_options_bounds_llm_retries():
-    """Gemini returns an empty completion when the prompt tells it to stay
-    silent after a tool succeeds; the plugin treats that as a retryable error.
-    With livekit's default (3 retries, 2s apart) every silent turn cost ~6s of
-    dead air in which the user could not be heard. One fast retry is enough."""
+    """Gemini returns an empty completion when it has nothing to say after a
+    tool succeeds; the plugin treats that as a retryable error. With livekit's
+    default (3 retries, 2s apart) every silent turn cost ~6s of dead air in
+    which the user could not be heard. livekit now never retries the LLM;
+    FridayAgent._complete does, at most once (tests/test_llm_turns.py)."""
     from friday.providers import build_session_conn_options
     from friday.config import LLM_MAX_RETRY
 
     opts = build_session_conn_options()
-    assert opts.llm_conn_options.max_retry == LLM_MAX_RETRY
+    assert opts.llm_conn_options.max_retry == 0
     assert LLM_MAX_RETRY <= 1
 
 

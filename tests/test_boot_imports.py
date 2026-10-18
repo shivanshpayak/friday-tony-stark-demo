@@ -118,9 +118,10 @@ def test_domain_tool_names_still_resolve_lazily():
 
 
 def test_disabled_session_gate_does_not_load_encoder(monkeypatch):
-    """SESSION_SPEAKER_GATE_ENABLED=False still loaded Resemblyzer (torch) in
-    the agent — ~4.5s on the boot critical path for a gate that never runs."""
+    """SESSION_SPEAKER_GATE_ENABLED=False still loaded the encoder in the
+    agent — on the boot critical path, for a gate that never runs."""
     import friday.speaker_gate as sg
+    import friday.voice_encoder as ve
 
     # Record construction rather than raising: SessionSpeakerGate swallows
     # init exceptions, which would hide a load attempt.
@@ -130,8 +131,7 @@ def test_disabled_session_gate_does_not_load_encoder(monkeypatch):
         def __init__(self, *a, **k):
             constructed.append(True)
 
-    monkeypatch.setitem(sys.modules, "resemblyzer",
-                        types.SimpleNamespace(VoiceEncoder=_SpyEncoder))
+    monkeypatch.setattr(ve, "VoiceEncoder", _SpyEncoder)
     monkeypatch.setattr(sg, "SESSION_SPEAKER_GATE_ENABLED", False)
 
     gate = sg.SessionSpeakerGate()

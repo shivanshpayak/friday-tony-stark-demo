@@ -22,7 +22,7 @@ from pathlib import Path
 
 STATE_FILE = Path(__file__).resolve().parents[1] / "runtime" / "quiet.json"
 
-# nmcli takes ~20ms; the launcher asks on every wake-word hit.
+# nmcli takes ~20ms (with --rescan no); the launcher asks on every wake-word hit.
 _SSID_TTL = 15.0
 _ssid_cache: tuple[float, str] = (0.0, "")
 
@@ -36,8 +36,11 @@ def current_ssid(*, fresh: bool = False) -> str:
     ssid = ""
     if shutil.which("nmcli"):
         try:
+            # --rescan no: a plain `dev wifi` starts a fresh scan whenever the
+            # last one is ~30 s old, which takes 3 s or more. That timed out, the
+            # network read as "" for the next 15 s, and quiet mode lapsed at school.
             out = subprocess.run(
-                ["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"],
+                ["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi", "list", "--rescan", "no"],
                 capture_output=True, text=True, timeout=3,
             ).stdout
             for line in out.splitlines():

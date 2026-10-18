@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from enum import Enum
 from pathlib import Path
 
@@ -33,7 +34,7 @@ from friday.recovery import (
 )
 from friday.config import FASTPATH_ENABLED, TEXT_TURN_TIMEOUT
 from friday import handoff, plat, quiet
-from friday.voiceprint import clean_clip
+from friday.voiceprint import clean_clip, save_clip
 
 _WIN = sys.platform == "win32"
 if _WIN:
@@ -222,7 +223,7 @@ SPEAKER_BUFFER_SECONDS = 2.5   # last N seconds of mic audio to verify against
 
 # openwakeword occasionally fires on a near-silent mic (idle, or at night).
 # A wake whose buffer never peaks above this (float, ~100 int16 LSB) cannot be
-# the user speaking: Resemblyzer scores such audio ≤ 0.63, under the threshold
+# the user speaking: the encoder scores such audio ≤ 0.63, under the threshold
 # above, so dropping it early only skips work that would be rejected anyway.
 WAKE_SILENCE_PEAK = 0.003
 
@@ -284,6 +285,43 @@ def _is_near_silent(wav_float: np.ndarray) -> bool:
     return wav_float.size == 0 or float(np.max(np.abs(wav_float))) < WAKE_SILENCE_PEAK
 
 
+# The audio behind recent wake words, with the score each got — the evidence
+# for "why didn't it accept me". Untracked, this machine only, oldest dropped.
+WAKE_CLIP_DIR = Path(__file__).parent / "runtime" / "wake_clips"
+WAKE_CLIPS_KEPT = 40
+
+
+def _keep_wake_clip(wav_float: np.ndarray, sim: float, matched: bool) -> None:
+    try:
+        name = "%s_sim%.2f_%s.wav" % (time.strftime("%Y%m%d-%H%M%S"), sim,
+                                      "accepted" if matched else "rejected")
+        save_clip(WAKE_CLIP_DIR / name, wav_float)
+        for old in sorted(WAKE_CLIP_DIR.glob("*.wav"))[:-WAKE_CLIPS_KEPT]:
+            old.unlink(missing_ok=True)
+    except Exception as e:
+        logger.debug("Could not keep wake clip (non-fatal): %s", e)
+
+
+def _skip_openwakeword_training_imports() -> None:
+    """Keep scipy and sklearn out of the launcher.
+
+    openwakeword's package __init__ imports its verifier-*training* module,
+    which imports scipy and sklearn — ~65 MB resident and most of the import
+    time — for a feature detection never touches. Registering a stand-in
+    module first makes that import a no-op.
+    """
+    name = "openwakeword.custom_verifier_model"
+    if name in sys.modules:
+        return
+
+    def train_custom_verifier(*args, **kwargs):
+        raise RuntimeError("openwakeword verifier training is disabled in the launcher")
+
+    stub = types.ModuleType(name)
+    stub.train_custom_verifier = train_custom_verifier
+    sys.modules[name] = stub
+
+
 class WakeWordListener:
     """Continuously listens for the wake word on the mic."""
 
@@ -291,6 +329,7 @@ class WakeWordListener:
         # Imported here, not at module top: openwakeword's package import takes
         # ~12s cold, and at module level it delayed spawning the agent by that
         # much. Here it overlaps the agent's boot. See launcher_loop.
+        _skip_openwakeword_training_imports()
         from openwakeword.model import Model as WakeWordModel
 
         # Use onnx instead of tflite — tflite-runtime has no Windows wheels.
@@ -407,7 +446,7 @@ class WakeWordListener:
 
 
 # ---------------------------------------------------------------------------
-# Speaker verification (Resemblyzer)
+# Speaker verification (friday/voice_encoder.py)
 # ---------------------------------------------------------------------------
 
 class SpeakerVerifier:
@@ -418,13 +457,11 @@ class SpeakerVerifier:
         self._threshold = threshold
         self._encoder = None
         self._reference = None
-        # Serialises encoder use so the boot warmup can't race a wake word.
-        self._lock = threading.Lock()
         if embedding_path.exists():
             try:
                 self._reference = np.load(embedding_path)
-                from resemblyzer import VoiceEncoder  # heavy import, lazy
-                self._encoder = VoiceEncoder(verbose=False)
+                from friday.voice_encoder import VoiceEncoder
+                self._encoder = VoiceEncoder()
                 logger.info(
                     "SpeakerVerifier loaded (threshold=%.2f, ref shape=%s)",
                     threshold, self._reference.shape,
@@ -444,35 +481,12 @@ class SpeakerVerifier:
     def enabled(self) -> bool:
         return self._encoder is not None and self._reference is not None
 
-    def warm(self) -> None:
-        """Pay Resemblyzer's JIT cost at boot instead of on the first wake word.
-
-        The first embed_utterance() call triggers librosa/numba JIT compilation
-        and takes ~4.6s; every call after is ~20ms. Without this the FIRST wake
-        word after every boot stalled ~5s inside verification — long enough to
-        blow past the agent's PREPARE handshake timeout and abort the
-        activation. Runs on a background thread during boot, where it overlaps
-        the agent subprocess's own cold start and costs nothing.
-        """
-        if not self.enabled:
-            return
-        try:
-            started = time.monotonic()
-            dummy = (np.random.randn(AUDIO_RATE) * 0.01).astype(np.float32)
-            with self._lock:
-                self._encoder.embed_utterance(clean_clip(dummy))
-            logger.info("Speaker verifier warm (%.1fs JIT paid at boot)",
-                        time.monotonic() - started)
-        except Exception as e:
-            logger.debug("Speaker verifier warmup failed (non-fatal): %s", e)
-
     def verify(self, wav_float: np.ndarray) -> tuple[bool, float]:
         """Return (matched, similarity). If disabled, always (True, 1.0)."""
         if not self.enabled:
             return True, 1.0
         try:
-            with self._lock:
-                emb = self._encoder.embed_utterance(clean_clip(wav_float))
+            emb = self._encoder.embed_utterance(clean_clip(wav_float))
             ref = self._reference
             sim = float(np.dot(emb, ref) / ((np.linalg.norm(emb) * np.linalg.norm(ref)) + 1e-9))
             return sim >= self._threshold, sim
@@ -1024,7 +1038,7 @@ async def launcher_loop():
 
     # ---- Cold boot: spawn the agent FIRST ----------------------------------
     # Its ~20s boot is the long pole. Starting it before the launcher loads its
-    # own models (openwakeword ~12s cold, Resemblyzer, Vosk) lets the two
+    # own models (openwakeword, the speaker encoder, Vosk) lets the two
     # overlap instead of adding up. The mic stream still opens only after
     # FRIDAY_READY. Guarded by tests/test_launcher_boot_order.py.
     overlay.show_loading("Booting up Omnicron...")
@@ -1037,11 +1051,6 @@ async def launcher_loop():
     try:
         wakeword = WakeWordListener()
         verifier = SpeakerVerifier()
-        # Pay Resemblyzer's ~4.6s JIT now, in parallel with the agent's cold
-        # boot, so the first wake word doesn't stall in verification. See warm().
-        if verifier.enabled:
-            threading.Thread(target=verifier.warm, daemon=True,
-                             name="verifier-warmup").start()
 
         # Fast path: fixed commands ("mute", "play", "next") spoken in the same
         # breath as the wake word run here, never reaching the agent. Import is
@@ -1181,6 +1190,8 @@ async def launcher_loop():
         try:
             writer.write((json.dumps(response) + "\n").encode("utf-8"))
             await writer.drain()
+        except (ConnectionResetError, BrokenPipeError):
+            pass    # the client gave up waiting (the tray waits 1.5 s); nobody to answer
         finally:
             writer.close()
 
@@ -1352,6 +1363,9 @@ async def launcher_loop():
                         verify_task, tail_task
                     )
 
+                    if verifier.enabled:
+                        threading.Thread(target=_keep_wake_clip, daemon=True,
+                                         args=(wav, sim, matched)).start()
                     if verifier.enabled and not matched:
                         logger.info(
                             "Wake word ignored — speaker mismatch (sim=%.3f < %.2f)",
