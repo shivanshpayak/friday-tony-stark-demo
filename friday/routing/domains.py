@@ -60,6 +60,10 @@ DOMAINS: dict[str, ToolDomain] = {
             "shazam",
             "humming",
             "what's playing",
+            "queue",
+            "lyrics",
+            "goes like",
+            "liked songs",
         ),
     ),
     "google": ToolDomain(
@@ -95,6 +99,17 @@ DOMAINS: dict[str, ToolDomain] = {
             "dashboard",
             "elastic",
             "roborio",
+        ),
+    ),
+    "phone": ToolDomain(
+        name="phone",
+        description="His phone over KDE Connect: ring it, battery, send it links, files and notes",
+        keywords=(
+            "phone",
+            "iphone",
+            "my phone",
+            "find my phone",
+            "ring my phone",
         ),
     ),
 }

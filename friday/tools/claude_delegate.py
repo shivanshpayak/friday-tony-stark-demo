@@ -9,6 +9,7 @@ Jarvis speaks a summary of what Claude did.
 
 import logging
 import os
+import shutil
 import sys
 import subprocess
 import threading
@@ -145,7 +146,13 @@ def register(mcp):
         """Delegate a complex question or task to Claude Code running in the
         background. Use this for deep analysis, code generation, research
         synthesis, or anything that benefits from Claude's reasoning.
-        Jarvis will speak the result when Claude finishes."""
+        Jarvis will speak the result when Claude finishes. Not for math:
+        calculate solves equations and matrices exactly, right away."""
+        # Without the CLI the job dies at once (exit 127) and the reply path
+        # has nothing to wait for, so say so now instead of starting it.
+        if not shutil.which("claude"):
+            return ("Claude Code isn't installed on this machine, sir, "
+                    "so I can't hand that off.")
 
         task_id = f"claude_{datetime.now().strftime('%Y%m%d')}_{uuid4().hex[:6]}"
 

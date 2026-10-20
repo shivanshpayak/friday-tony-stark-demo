@@ -39,6 +39,16 @@ def add(item: ScheduledItem) -> None:
     _write(items)
 
 
+def update(item: ScheduledItem) -> None:
+    """Replace the stored item with the same id; gone already, nothing happens."""
+    items = all_items()
+    for n, i in enumerate(items):
+        if i.id == item.id:
+            items[n] = item
+            _write(items)
+            return
+
+
 def remove(item_id: str) -> Optional[ScheduledItem]:
     items = all_items()
     for i in items:

@@ -172,7 +172,7 @@ from friday.config import (
     SYSTEM_PROMPT, DISMISSAL_PHRASES, SLEEP_RESPONSES, READY_RESPONSES,
     STT_PROVIDER, LLM_PROVIDER, TTS_PROVIDER,
     MAX_HISTORY_ITEMS, SESSION_SPEAKER_GATE_MAX_REJECTS, LLM_MAX_RETRY, logger,
-    TTS_FIRST_AUDIO_TIMEOUT, STT_WORD_SILENCE_END,
+    TTS_FIRST_AUDIO_TIMEOUT, STT_WORD_SILENCE_END, STT_UNFINISHED_SILENCE_END,
     RECOVERY_LINE_INSTRUCTIONS, PREPARE_WAIT_TIMEOUT, TEXT_TURN_TIMEOUT,
 )
 from friday.providers import (
@@ -182,7 +182,7 @@ from friday.voice_cache import PrerenderedLines, audio_stream
 from friday.tts_trim import trim_edge_silence
 from friday.turn_end import end_turn_on_words
 from friday.routing import LocalDomainToolPool
-from friday import focus
+from friday import focus, quiet
 from friday.small_talk import is_small_talk
 from friday.speaker_gate import get_speaker_gate
 from friday.mic_filter import HumFilter
@@ -263,6 +263,36 @@ def _normalize_speech(text: str) -> str:
 
 
 _DISMISSAL_NORMALIZED = tuple(_normalize_speech(p) for p in DISMISSAL_PHRASES)
+
+
+def _is_own_echo(text: str) -> bool:
+    """A transcript that is nothing but "sir".
+
+    He never says just that to Jarvis, and Jarvis ends nearly every line with
+    it: the last word is still coming out of the speakers when the mic reopens,
+    so Deepgram hears "Sir?" as if he had said it. Answered ("Yes, sir?"), it
+    ends in "sir" again and the two feed each other every few seconds.
+    """
+    words = _normalize_speech(text or "").split()
+    return bool(words) and all(w == "sir" for w in words)
+
+
+async def _drop_own_echo(events):
+    """Pass STT events through, minus interim and final transcripts that are
+    Jarvis's own "sir" (see _is_own_echo). Interims go too, so the echo can't
+    start a user turn either."""
+    async for ev in events:
+        if (
+            isinstance(ev, stt.SpeechEvent)
+            and ev.type in (stt.SpeechEventType.INTERIM_TRANSCRIPT,
+                            stt.SpeechEventType.FINAL_TRANSCRIPT)
+            and ev.alternatives
+            and _is_own_echo(ev.alternatives[0].text)
+        ):
+            if ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                logger.info("Dropped echo of own voice: %r", ev.alternatives[0].text)
+            continue
+        yield ev
 
 
 def _is_dismissal(text: str) -> bool:
@@ -458,10 +488,11 @@ class FridayAgent(Agent):
                 alarm_task.cancel()
 
         def _transcribe(frames):
-            events = Agent.default.stt_node(self, frames, model_settings)
+            events = _drop_own_echo(Agent.default.stt_node(self, frames, model_settings))
             if _stt_ends_turns():
                 # Fan noise never lets Deepgram hear the end of a turn.
-                events = end_turn_on_words(events, STT_WORD_SILENCE_END)
+                events = end_turn_on_words(events, STT_WORD_SILENCE_END,
+                                           STT_UNFINISHED_SILENCE_END)
             return events
 
         if not gate.enabled or self._gate_fail_open:
@@ -866,6 +897,11 @@ async def _fire_greeting(session) -> None:
 SIGNOFF_START_TIMEOUT = 5.0
 SIGNOFF_MAX_SPEECH = 10.0
 
+# A timer's or reminder's line may take this long (LLM + TTS + playout) before
+# the launcher is told it fired anyway — a hung TTS must not keep an alarm
+# from ringing.
+SCHEDULED_SPEECH_TIMEOUT = 30.0
+
 
 async def _wait_for_signoff(
     speaking: asyncio.Event,
@@ -1105,6 +1141,13 @@ async def entrypoint(ctx: JobContext) -> None:
         max_tool_steps=3,
     )
 
+    # Dismissal event — set when the user says goodbye, cleared on re-activation.
+    # Start in "dismissed" state so the activation loop's first iteration
+    # waits for a START command instead of immediately looping. The task and
+    # scheduler callbacks below read it: set means no conversation is open.
+    dismissed = asyncio.Event()
+    dismissed.set()
+
     # -----------------------------------------------------------------------
     # Phase 0.5: Task Orchestration Setup
     # -----------------------------------------------------------------------
@@ -1161,6 +1204,9 @@ async def entrypoint(ctx: JobContext) -> None:
                 )
         except Exception as e:
             logger.error(f"Task completion callback failed: {e}")
+        finally:
+            if dismissed.is_set():
+                print("ANNOUNCE_DONE", flush=True)   # launcher lowers the overlay
             
     set_completion_callback(_on_task_finished)
 
@@ -1170,23 +1216,33 @@ async def entrypoint(ctx: JobContext) -> None:
     from friday.scheduling import set_fire_callback, start_scheduler
 
     async def _on_scheduled_fire(item):
+        # Idle (no session open), the launcher takes it from here once the line
+        # is said: a fresh timer or an alarm rings until a stop phrase is heard,
+        # anything else just gets the overlay put away (friday/alarm.py). In quiet mode
+        # nothing is said; the launcher shows a notification instead.
+        idle = dismissed.is_set()
         try:
             logger.info("Scheduled %s fired (%s): %s", item.kind, item.id, item.message)
-            await session.generate_reply(
-                instructions=await asyncio.to_thread(_scheduled_fire_instructions, item),
-                tool_choice="none",
-            )
+            # Always built: for a focus session it also ends the session.
+            instructions = await asyncio.to_thread(_scheduled_fire_instructions, item)
+            if idle and await asyncio.to_thread(quiet.is_quiet):
+                logger.info("Quiet mode — not speaking it")
+            else:
+                await asyncio.wait_for(
+                    session.generate_reply(instructions=instructions, tool_choice="none"),
+                    timeout=SCHEDULED_SPEECH_TIMEOUT,
+                )
         except Exception as e:
             logger.error("Scheduled fire callback failed: %s", e)
+        finally:
+            if idle and dismissed.is_set():
+                print("SCHEDULED_FIRED " + json.dumps({
+                    "kind": item.kind, "message": item.message, "fire_at": item.fire_at,
+                    "label": item.label,
+                }), flush=True)
 
     set_fire_callback(_on_scheduled_fire)
     start_scheduler()
-
-    # Dismissal event — set when the user says goodbye, cleared on re-activation.
-    # Start in "dismissed" state so the activation loop's first iteration
-    # waits for a START command instead of immediately looping.
-    dismissed = asyncio.Event()
-    dismissed.set()
 
     # Fatal-close recovery state. `_fatal[0]` is raised by the close handler when
     # an unrecoverable STT/connection error closes the session; `_intentional[0]`

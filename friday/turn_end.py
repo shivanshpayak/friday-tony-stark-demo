@@ -20,19 +20,46 @@ seconds (measured: 3s after the last word, with the endpoint never arriving),
 so waiting for it would keep most of the delay. When the words stop changing
 while still interim, the interim transcript is promoted to final here, and
 Deepgram's late final for the same words is dropped when it turns up.
+
+Deepgram also goes back over audio it already reported, up to ~8s later and
+often with a word more or less at the front: "Set a timer for thirty
+minutes." came back as "are of Set a timer for thirty minutes." and then
+twice more, and the second copy set a second timer. Each word carries its
+audio time, so words for audio already passed on are cut (_unheard).
 """
 
 import asyncio
 import dataclasses
+import logging
 import time
 from typing import AsyncIterable, AsyncIterator
 
 from livekit.agents import stt
 
+logger = logging.getLogger("friday-agent")
+
 _START = stt.SpeechEventType.START_OF_SPEECH
 _END = stt.SpeechEventType.END_OF_SPEECH
 _FINAL = stt.SpeechEventType.FINAL_TRANSCRIPT
 _INTERIM = stt.SpeechEventType.INTERIM_TRANSCRIPT
+
+# How long words passed on are remembered for spotting a copy. The latest copy
+# in the logs came 8s after the original; a real repeat comes after a reply.
+_MEMORY = 15.0
+
+# A turn that stops on one of these isn't finished; he is thinking of the
+# rest. In the logs a lone "Play" (pause) toggled the music three times, and
+# "Keep skipping ... until you get to ... attractive by Jordan" went in as
+# three requests. Words that often do end a sentence ("on", "is", "her",
+# "call") are left out: waiting on them would slow down finished requests.
+_UNFINISHED = frozenset("""
+    a an the my your his our their some
+    to by of for from with into like until than
+    and but or because if
+    play open set put pull queue send
+    it's i'm i'll i'd gonna wanna called named
+    i let let's uh um er hmm
+""".split())
 
 
 def _words(ev) -> list[str]:
@@ -65,10 +92,75 @@ def _after(ev, spoken: list[str]):
     return _with_text(ev, ev.type, " ".join(remainder))
 
 
-async def end_turn_on_words(events: AsyncIterable, quiet: float) -> AsyncIterator:
-    """Re-time START/END_OF_SPEECH in an STT event stream (see module doc)."""
+def _timed(ev) -> list | None:
+    """The event's words with their audio times, or None if the STT gave none."""
+    words = ev.alternatives[0].words if ev.alternatives else None
+    if not words or not all(isinstance(getattr(w, "start_time", None), (int, float))
+                            and isinstance(getattr(w, "end_time", None), (int, float))
+                            for w in words):
+        return None
+    return words
+
+
+class _Heard:
+    """The timed words passed on as final in the last _MEMORY seconds."""
+
+    def __init__(self) -> None:
+        self._spans: list[tuple[float, float, set[str]]] = []  # (when, audio end, words)
+
+    def add(self, words: list) -> None:
+        self._spans.append((time.monotonic(), max(w.end_time for w in words),
+                            {_bare(w) for w in words}))
+
+    def recent(self) -> tuple[float, set[str]]:
+        """(audio time up to which words were heard, those words)."""
+        cutoff = time.monotonic() - _MEMORY
+        self._spans = [s for s in self._spans if s[0] >= cutoff]
+        if not self._spans:
+            return 0.0, set()
+        return (max(end for _, end, _ in self._spans),
+                set().union(*(words for _, _, words in self._spans)))
+
+
+def _bare(word: str) -> str:
+    return "".join(c for c in word.lower() if c.isalnum() or c == "'")
+
+
+def _unheard(ev, words: list, heard: _Heard):
+    """`ev` minus its leading words for audio already passed on; None if no
+    word is new.
+
+    Audio times alone can mislead: a reconnected Deepgram stream starts its
+    clock again at zero, so new speech would look old. A copy also repeats the
+    words, so the cut only happens when most of the words in that stretch were
+    just heard.
+    """
+    until, recent = heard.recent()
+    cut = next((i for i, w in enumerate(words)
+                if (w.start_time + w.end_time) / 2 > until), len(words))
+    if cut == 0 or sum(_bare(w) in recent for w in words[:cut]) * 2 < cut:
+        return ev
+    if cut == len(words):
+        return None
+    tokens = ev.alternatives[0].text.split()
+    rest = tokens[cut:] if len(tokens) == len(words) else [str(w) for w in words[cut:]]
+    first = dataclasses.replace(ev.alternatives[0], text=" ".join(rest),
+                                words=words[cut:], start_time=words[cut].start_time)
+    return dataclasses.replace(ev, alternatives=[first, *ev.alternatives[1:]])
+
+
+async def end_turn_on_words(events: AsyncIterable, quiet: float,
+                            unfinished_quiet: float | None = None) -> AsyncIterator:
+    """Re-time START/END_OF_SPEECH in an STT event stream (see module doc).
+
+    The turn ends `quiet` seconds after the words stop changing, or at
+    Deepgram's endpoint. When the last word leaves the sentence hanging
+    (_UNFINISHED), it waits `unfinished_quiet` seconds instead, and holds
+    Deepgram's endpoint until then too.
+    """
     queue: asyncio.Queue = asyncio.Queue()
     done = object()
+    hold = max(quiet, unfinished_quiet or quiet)
 
     async def pump() -> None:
         try:
@@ -83,17 +175,27 @@ async def end_turn_on_words(events: AsyncIterable, quiet: float) -> AsyncIterato
     talking = False             # START_OF_SPEECH sent, END_OF_SPEECH not yet
     changed_at = 0.0            # when the transcript last gained or changed words
     interim = None              # latest interim transcript not yet finalised
-    promoted: list[str] = []    # words of an interim this wrapper finalised itself
+    promoted: list[str] = []    # untimed words this wrapper finalised itself
+    heard = _Heard()            # timed words passed on as final
+    tail: list[str] = []        # words of this turn's latest transcript
     try:
         while True:
+            unfinished = bool(tail) and tail[-1] in _UNFINISHED
+            limit = hold if unfinished else quiet
             try:
-                wait = max(0.0, changed_at + quiet - time.monotonic()) if talking else None
+                wait = max(0.0, changed_at + limit - time.monotonic()) if talking else None
                 ev = await asyncio.wait_for(queue.get(), wait)
             except asyncio.TimeoutError:
                 if interim is not None:
-                    promoted = _words(interim)
+                    timed = _timed(interim)
+                    if timed:
+                        heard.add(timed)
+                    else:
+                        # Every stretch promoted since Deepgram's last final:
+                        # its late final reports them all, from the first.
+                        promoted += _words(interim)
                     yield _with_text(interim, _FINAL, interim.alternatives[0].text)
-                talking, interim = False, None
+                talking, interim, tail = False, None, []
                 yield stt.SpeechEvent(type=_END)
                 continue
             if ev is done:
@@ -107,15 +209,27 @@ async def end_turn_on_words(events: AsyncIterable, quiet: float) -> AsyncIterato
             if ev.type == _START:
                 continue                # the detector's opinion; words decide
             if ev.type == _END:
+                if talking and unfinished and hold > quiet:
+                    continue            # the timer above ends it if nothing follows
                 if talking:
-                    talking, interim = False, None
+                    talking, interim, tail = False, None, []
                     yield ev
                 continue                # else: this turn was already ended here
             if ev.type not in (_FINAL, _INTERIM) or not _words(ev):
                 yield ev
                 continue
 
-            if promoted:
+            timed = _timed(ev)
+            if timed:
+                fresh = _unheard(ev, timed, heard)
+                if fresh is not ev:
+                    logger.info("STT went back over words already handled: %r -> %r",
+                                ev.alternatives[0].text,
+                                fresh.alternatives[0].text if fresh else None)
+                if fresh is None:
+                    continue
+                ev = fresh
+            elif promoted:
                 fresh = _after(ev, promoted)
                 if ev.type == _FINAL:
                     promoted = []       # that stretch of audio is now closed
@@ -125,10 +239,16 @@ async def end_turn_on_words(events: AsyncIterable, quiet: float) -> AsyncIterato
             if not talking:
                 talking = True
                 yield stt.SpeechEvent(type=_START)
+            elif unfinished and time.monotonic() - changed_at > quiet:
+                logger.info("Waited past %r and he went on: %r", tail[-1],
+                            ev.alternatives[0].text)
             if ev.type == _FINAL:
+                if timed:
+                    heard.add(ev.alternatives[0].words)
                 interim, changed_at = None, time.monotonic()
             elif interim is None or _words(ev) != _words(interim):
                 interim, changed_at = ev, time.monotonic()
+            tail = _words(ev)
             yield ev
     finally:
         pump_task.cancel()

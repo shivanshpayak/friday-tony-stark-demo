@@ -69,17 +69,30 @@ _LINUX_BEEPS = {
 }
 
 
-def play_wav(path) -> None:
-    """Play a WAV file without blocking. Raises if no player is available."""
+def play_wav(path) -> subprocess.Popen | None:
+    """Play a WAV file without blocking. Raises if no player is available.
+
+    Returns a handle for stop_sound(): the player process on Linux, None on
+    Windows (winsound plays one sound at a time).
+    """
     if IS_WINDOWS:
         import winsound
         winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
-        return
+        return None
     for player in _LINUX_PLAYERS:
         if shutil.which(player[0]):
-            _detached([*player, str(path)])
-            return
+            return _detached([*player, str(path)])
     raise RuntimeError("no audio player found (pw-play / paplay / aplay)")
+
+
+def stop_sound(handle: subprocess.Popen | None) -> None:
+    """Cut short a sound started by play_wav()."""
+    if IS_WINDOWS:
+        import winsound
+        winsound.PlaySound(None, 0)
+        return
+    if handle is not None and handle.poll() is None:
+        handle.terminate()
 
 
 def beep(kind: str = "info") -> None:
@@ -200,12 +213,18 @@ def restart_into(os_name: str, delay: float = 6.0) -> None:
 
 # --- desktop notifications -------------------------------------------------
 
-def notify(title: str, body: str = "", *, icon: str = "audio-input-microphone") -> None:
-    """Show a desktop notification. Silent no-op where there is no notifier."""
+def notify(title: str, body: str = "", *, icon: str = "audio-input-microphone",
+           sticky: bool = False) -> None:
+    """Show a desktop notification. Silent no-op where there is no notifier.
+
+    `sticky` stays on screen until dismissed (critical urgency) — the silent
+    stand-in for an alarm that would have rung.
+    """
     if IS_WINDOWS or not shutil.which("notify-send"):
         return
+    urgency = ["--urgency=critical"] if sticky else []
     try:
-        _detached(["notify-send", "--app-name=JARVIS", f"--icon={icon}", title, body])
+        _detached(["notify-send", "--app-name=JARVIS", f"--icon={icon}", *urgency, title, body])
     except Exception:
         pass
 

@@ -95,6 +95,19 @@ def play_player(hint: str) -> bool:
     return False
 
 
+def open_uri(hint: str, uri: str) -> bool:
+    """Have the running player whose bus name contains `hint` play `uri`
+    (Spotify takes spotify:track:… and starts it). False if it isn't running."""
+    if _WIN:
+        return False
+    for name in _mpris_players():
+        if hint in name.lower():
+            _run(["busctl", "--user", "call", name, _MPRIS_PATH, _MPRIS_PLAYER,
+                  "OpenUri", "s", uri])
+            return True
+    return False
+
+
 def now_playing(player_hint: str = "") -> str | None:
     """'Artist - Title' from MPRIS metadata, or None when nothing is loaded.
 
@@ -255,6 +268,134 @@ def _get_app_volume(app_name: str) -> tuple[float, str] | None:
                 vol = session._ctl.QueryInterface(ISimpleAudioVolume)
                 return float(vol.GetMasterVolume()), session.Process.name()
         return None
+    finally:
+        CoUninitialize()
+
+
+# --- ducking (music turned down while an alarm rings) ----------------------
+
+# JARVIS's own short sounds (chimes, the alarm). PipeWire remembers each app's
+# volume, so one of these ducked and gone before the restore would leave every
+# later chime at the ducked level.
+_OWN_PLAYERS = ("pw-play", "paplay", "aplay")
+# A stream whose volume moved more than this since we ducked it was changed by
+# hand mid-alarm, and is left where the user put it.
+_DUCK_TOLERANCE = 0.01
+
+
+def _channel_values(stream: dict) -> list[int]:
+    """Raw per-channel volumes (65536 = 100%), in channel-map order."""
+    return [int(ch.get("value", 0)) for ch in (stream.get("volume") or {}).values()]
+
+
+def _client_pids() -> dict[str, int]:
+    """PipeWire client index → process id. Streams from ALSA apps (JARVIS's
+    own voice among them) carry no pid of their own; their client does."""
+    pids = {}
+    for client in json.loads(_run(["pactl", "--format=json", "list", "clients"])):
+        try:
+            pids[str(client["index"])] = int(client["properties"]["application.process.id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    return pids
+
+
+def _stream_pid(stream: dict, client_pids: dict[str, int]) -> int | None:
+    try:
+        return int(stream.get("properties", {})["application.process.id"])
+    except (KeyError, TypeError, ValueError):
+        return client_pids.get(str(stream.get("client")))
+
+
+def _session_key(session) -> str:
+    """Windows: one process can own several audio sessions."""
+    return f"{session.ProcessId}:{getattr(session, 'InstanceIdentifier', '') or ''}"
+
+
+def duck_playback(factor: float, keep_pids: frozenset[int] = frozenset()) -> list[dict]:
+    """Turn every playing stream down to `factor` of its volume.
+
+    Returns what unduck_playback() needs to put them back. Streams belonging to
+    `keep_pids` (JARVIS's own processes, so its voice stays clear) are left alone.
+    """
+    factor = max(0.0, min(1.0, factor))
+    ducked: list[dict] = []
+    if not _WIN:
+        client_pids = _client_pids()
+        for stream in _sink_inputs():
+            props = stream.get("properties", {})
+            app = f'{props.get("application.name", "")} {props.get("application.process.binary", "")}'
+            if (stream.get("corked") or _stream_pid(stream, client_pids) in keep_pids
+                    or any(player in app for player in _OWN_PLAYERS)):
+                continue
+            volume = _channel_values(stream)
+            if not any(volume):
+                continue
+            lowered = [int(v * factor) for v in volume]
+            _run(["pactl", "set-sink-input-volume", str(stream["index"]), *map(str, lowered)])
+            ducked.append({"id": stream["index"], "volume": volume, "ducked": lowered})
+        return ducked
+    CoInitialize()
+    try:
+        for session in AudioUtilities.GetAllSessions():
+            try:
+                # State 1 = AudioSessionStateActive: something is playing.
+                if (not session.Process or session.ProcessId in keep_pids
+                        or getattr(session, "State", 1) != 1):
+                    continue
+                vol = session._ctl.QueryInterface(ISimpleAudioVolume)
+                level = float(vol.GetMasterVolume())
+                if level <= 0:
+                    continue
+                vol.SetMasterVolume(level * factor, None)
+                ducked.append({"id": _session_key(session), "volume": [level],
+                               "ducked": [level * factor]})
+            except Exception:
+                continue
+        return ducked
+    finally:
+        CoUninitialize()
+
+
+def _moved(now: list[float], ducked: list[float], full_scale: float) -> bool:
+    return len(now) != len(ducked) or any(
+        abs(a - b) > _DUCK_TOLERANCE * full_scale for a, b in zip(now, ducked))
+
+
+def unduck_playback(ducked: list[dict]) -> int:
+    """Put back what duck_playback() turned down; return how many.
+
+    Skips a stream that has gone, or whose volume was changed by hand since.
+    """
+    restored = 0
+    if not ducked:
+        return restored
+    if not _WIN:
+        current = {s["index"]: _channel_values(s) for s in _sink_inputs()}
+        for item in ducked:
+            now = current.get(item["id"])
+            if now is None or _moved(now, item["ducked"], 65536):
+                continue
+            _run(["pactl", "set-sink-input-volume", str(item["id"]),
+                  *map(str, item["volume"])])
+            restored += 1
+        return restored
+    CoInitialize()
+    try:
+        by_key = {item["id"]: item for item in ducked}
+        for session in AudioUtilities.GetAllSessions():
+            try:
+                item = by_key.pop(_session_key(session), None)
+                if item is None:
+                    continue
+                vol = session._ctl.QueryInterface(ISimpleAudioVolume)
+                if _moved([float(vol.GetMasterVolume())], item["ducked"], 1.0):
+                    continue
+                vol.SetMasterVolume(item["volume"][0], None)
+                restored += 1
+            except Exception:
+                continue
+        return restored
     finally:
         CoUninitialize()
 

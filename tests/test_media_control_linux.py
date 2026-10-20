@@ -93,3 +93,64 @@ def test_app_volume_targets_the_matching_stream(run):
     assert mc._set_app_volume("spotify", 0.3) == "spotify volume set to 30%."
     assert run.calls[-1] == ["pactl", "set-sink-input-volume", "9", "30%"]
     assert "Couldn't find" in mc._set_app_volume("vlc", 0.3)
+
+
+# --- ducking: music turned down while an alarm rings -------------------------
+
+def _stream(index, client, app, volume, corked=False, pid=None):
+    props = {"application.name": app}
+    if pid is not None:
+        props["application.process.id"] = str(pid)
+    return {"index": index, "client": str(client), "corked": corked, "properties": props,
+            "volume": {f"ch{i}": {"value": v, "value_percent": f"{v * 100 // 65536}%"}
+                       for i, v in enumerate(volume)}}
+
+
+JARVIS_PID = 20888
+
+
+def _mixer(run, streams):
+    run.replies[("pactl", "--format=json", "list", "sink-inputs")] = json.dumps(streams)
+    run.replies[("pactl", "--format=json", "list", "clients")] = json.dumps([
+        # The agent's voice is an ALSA stream: no pid of its own, only its client's.
+        {"index": 179, "properties": {"application.process.id": str(JARVIS_PID)}},
+        {"index": 50, "properties": {"application.process.id": "4242"}},
+    ])
+
+
+def _volume_sets(run):
+    return [c for c in run.calls if c[:2] == ["pactl", "set-sink-input-volume"]]
+
+
+def test_duck_lowers_music_and_spares_jarvis_and_its_chimes(run):
+    _mixer(run, [
+        _stream(10, 50, "spotify", [65536, 65536]),
+        _stream(11, 179, "PipeWire ALSA [python3.11]", [65536]),       # JARVIS's voice
+        _stream(12, 60, "pw-play", [65536]),                          # a chime
+        _stream(13, 50, "Firefox", [32768], corked=True),             # paused video
+    ])
+    ducked = mc.duck_playback(0.25, frozenset({JARVIS_PID}))
+    assert _volume_sets(run) == [["pactl", "set-sink-input-volume", "10", "16384", "16384"]]
+    assert ducked == [{"id": 10, "volume": [65536, 65536], "ducked": [16384, 16384]}]
+
+
+def test_unduck_puts_the_exact_volume_back(run):
+    _mixer(run, [_stream(10, 50, "spotify", [16384, 16384])])
+    restored = mc.unduck_playback(
+        [{"id": 10, "volume": [65536, 52428], "ducked": [16384, 16384]}])
+    assert restored == 1
+    assert _volume_sets(run) == [["pactl", "set-sink-input-volume", "10", "65536", "52428"]]
+
+
+def test_unduck_leaves_a_volume_changed_by_hand(run):
+    _mixer(run, [_stream(10, 50, "spotify", [40000, 40000])])
+    assert mc.unduck_playback(
+        [{"id": 10, "volume": [65536, 65536], "ducked": [16384, 16384]}]) == 0
+    assert _volume_sets(run) == []
+
+
+def test_unduck_skips_a_stream_that_has_gone(run):
+    _mixer(run, [])
+    assert mc.unduck_playback(
+        [{"id": 10, "volume": [65536], "ducked": [16384]}]) == 0
+    assert _volume_sets(run) == []

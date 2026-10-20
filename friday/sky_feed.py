@@ -14,8 +14,8 @@ This watches the sources and serves a snapshot as a long poll on loopback:
         "focus": {"started": 1760770000.0, "until": 1760772700.0}}
 
 The answer comes as soon as the snapshot changes (a notification counts), or
-after 25 s. Sources: runtime/scheduled.json (timers, and reminders in their
-last 15 minutes), runtime/tasks/active/*.json (unfinished tasks touched in the
+after 25 s. Sources: runtime/scheduled.json (timers, and reminders and switched-on
+alarms in their last 15 minutes), runtime/tasks/active/*.json (unfinished tasks touched in the
 last 3 hours, so a record a crash left behind doesn't orbit forever, plus ones
 that ended in the last 90 s, with how they ended), and the session bus's Notify calls, counted through `dbus-monitor --profile`, which
 reports that a notification was sent and nothing of what it says.
@@ -69,9 +69,10 @@ def read_timers(path: Path, now: float) -> list[dict]:
     timers = []
     for item in items if isinstance(items, list) else []:
         start, end = _epoch(item.get("created_at")), _epoch(item.get("fire_at"))
-        if start is None or end is None or end <= start:
+        if start is None or end is None or end <= start or item.get("enabled") is False:
             continue
-        if item.get("kind") == "reminder":
+        # An alarm set weeks ago for every weekday would orbit forever.
+        if item.get("kind") in ("reminder", "alarm"):
             if end - now > REMINDER_LEAD:
                 continue
             start = max(start, end - REMINDER_LEAD)

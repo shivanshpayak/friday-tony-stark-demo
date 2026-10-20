@@ -3,13 +3,14 @@ import os
 import io
 import base64
 import asyncio
+import json
 import logging
 import re
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from friday import plat
+from friday import desktop_input, plat
 from friday.screen_scroll import capture_scrolling
 
 logger = logging.getLogger("friday-agent")
@@ -82,11 +83,16 @@ def _encode_image_b64(img) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def _analyze_images(images: list, instruction: str) -> str:
+class VisionError(RuntimeError):
+    pass
+
+
+def _ask_vision(images: list, instruction: str, config: dict | None = None,
+                model: str = "gemini-2.5-flash") -> str:
     """Send one or more images + an instruction to Gemini vision; return the text."""
     api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key:
-        return "GOOGLE_API_KEY not set."
+        raise VisionError("GOOGLE_API_KEY not set.")
 
     parts = [{"text": instruction}]
     for img in images:
@@ -95,14 +101,18 @@ def _analyze_images(images: list, instruction: str) -> str:
 
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.5-flash:generateContent?key={api_key}"
+        f"{model}:generateContent"
     )
     payload = {"contents": [{"parts": parts}]}
+    if config:
+        payload["generationConfig"] = config
 
     last_error = None
     for attempt in range(1, _MAX_RETRIES + 1):
         try:
-            response = httpx.post(url, json=payload, timeout=_REQUEST_TIMEOUT_SECONDS)
+            # Key in a header, not the URL: httpx logs request URLs.
+            response = httpx.post(url, json=payload, headers={"x-goog-api-key": api_key},
+                                  timeout=_REQUEST_TIMEOUT_SECONDS)
             response.raise_for_status()
             text = _extract_text(response.json())
             if text:
@@ -112,7 +122,67 @@ def _analyze_images(images: list, instruction: str) -> str:
             last_error = str(e)
             logger.warning("Gemini vision call failed (attempt %d/%d): %s",
                            attempt, _MAX_RETRIES, e)
-    return f"Vision analysis failed: {last_error}"
+    raise VisionError(last_error)
+
+
+def _analyze_images(images: list, instruction: str) -> str:
+    try:
+        return _ask_vision(images, instruction)
+    except VisionError as e:
+        return f"Vision analysis failed: {e}"
+
+
+# Finding a click target. Measured on Kate's toolbar (14 targets, two window
+# positions): gemini-3.5-flash with thinking off landed every one within a few
+# pixels in ~1.3s; gemini-2.5-flash missed most by 20-90px at the same speed.
+_LOCATE_MODEL = "gemini-3.5-flash"
+_LOCATE_INSTRUCTION = (
+    "This is a screenshot of the user's whole screen. Find this on it: {target}\n"
+    "It is something to click or type into. If several things match, pick the "
+    "one the user most likely means (the visible, enabled one in the window in "
+    'front). Answer only with JSON: {{"box_2d": [ymin, xmin, ymax, xmax]}} '
+    'normalized to 0-1000, or {{"box_2d": null}} if it isn\'t on the screen.'
+)
+
+
+def parse_point(text: str) -> tuple[float, float] | None:
+    """The centre of Gemini's {"box_2d": [ymin, xmin, ymax, xmax]} (0-1000), as
+    (x, y) fractions of the image."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        match = re.search(r"\{.*\}", text or "", re.S)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except ValueError:
+            return None
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    box = data.get("box_2d") if isinstance(data, dict) else None
+    if not (isinstance(box, list) and len(box) == 4
+            and all(isinstance(v, (int, float)) and 0 <= v <= 1000 for v in box)):
+        return None
+    ymin, xmin, ymax, xmax = box
+    return (xmin + xmax) / 2000, (ymin + ymax) / 2000
+
+
+def locate_on_screen(target: str) -> tuple[float, float] | None:
+    """Where `target` is on the screen, as (x, y) fractions of the whole
+    desktop, or None if it isn't visible. Raises VisionError if the screen
+    couldn't be captured or read."""
+    try:
+        img = plat.grab_screen()
+    except Exception as e:
+        raise VisionError(f"Screen capture failed: {e}") from e
+    text = _ask_vision([img], _LOCATE_INSTRUCTION.format(target=target.strip()),
+                       {"responseMimeType": "application/json",
+                        "thinkingConfig": {"thinkingLevel": "minimal"}},
+                       model=_LOCATE_MODEL)
+    point = parse_point(text)
+    logger.info("locate_on_screen(%r) -> %s", target, point)
+    return point
 
 
 def _capture_and_analyze(prompt: str) -> str:
@@ -141,21 +211,10 @@ def _active_window_center():
 
 
 def _linux_scroll_fn():
-    """Wheel-scroll at the pointer. Wayland only lets a uinput tool (ydotool)
-    inject input; pyautogui reaches X11/XWayland windows and nothing else."""
-    import shutil
-    import subprocess
-    if shutil.which("ydotool"):
-        def scroll():
-            subprocess.run(
-                ["ydotool", "mousemove", "--wheel", "--", "0", str(-SCROLL_CLICKS)],
-                capture_output=True, timeout=5, check=True,
-            )
-        return scroll
-    if os.environ.get("XDG_SESSION_TYPE") == "wayland":
-        return None
-    import pyautogui
-    return lambda: pyautogui.scroll(-SCROLL_CLICKS)
+    """Wheel-scroll at the pointer, through the desktop's remote-control portal
+    (friday/desktop_input.py): Wayland lets nothing else put input into another
+    program's windows."""
+    return lambda: desktop_input.scroll(SCROLL_CLICKS)
 
 
 def _make_scroll_fn(pyautogui):
@@ -189,14 +248,13 @@ def _capture_scrolling_and_analyze(prompt: str) -> str:
             scroll_fn = _linux_scroll_fn()
     except Exception:
         return "I need the pyautogui component to read scrolling content, sir."
-    if scroll_fn is None:
-        return ("I can't scroll windows on this Wayland session without ydotool, "
-                "sir. I can still read what's currently on screen.")
     try:
         frames = capture_scrolling(
             grab_fn=plat.grab_screen,
             scroll_fn=scroll_fn,
         )
+    except desktop_input.InputError as e:
+        return str(e)
     except Exception as e:
         return f"Screen capture failed: {e}"
     if not frames:

@@ -27,13 +27,15 @@ Condensed — see `ARCHITECTURE.md` for how each works. All tools live in `frida
 - **Loop-until-success engine** (`friday/looping/`) — background, bounded, cancellable "do X until Y" runner over a curated action/check registry (`run_until` / `stop_loop`); generalizes the old hardcoded wifi monitor.
 - **Apps** — `launch_app` / `close_app` via Start Menu + UWP discovery, aliases, rescan.
 - **Files** — bounded list/read/search + confirmation-gated write/move/delete inside `FRIDAY_FILE_ROOTS`.
-- **Media** — Spotify play/pause/skip, URI search+autoplay, master + per-app volume (pycaw), song-from-humming.
+- **Media** — Spotify via its Web API (play a song/playlist/album/artist, queue, like, what's playing; songs named from sung lyrics), play/pause/skip, master + per-app volume, song-from-humming.
 - **System** — time, system info, `system_status` (CPU/RAM/disk/battery), clipboard read/write.
 - **Info** — web search, weather (current + forecast), maps/navigation (ETA + directions + nearby).
 - **Productivity** — timers + reminders (persistent scheduler), memory (`remember`/`forget`/`list_memories`), Google Calendar + Gmail (read).
 - **Screen** — `read_screen` (screenshot → Gemini vision).
+- **Desktop control** — `click_on_screen` (described target → Gemini `box_2d` → click), `type_text`, `press_keys`; Wayland via the Remote Desktop portal (one-time approval), Windows via `pyautogui`.
 - **Web automation** — learned, selector-based web flows with self-healing fallbacks (`run_web_flow` + `web_automation_context`).
 - **FRC** — robot-radio wifi monitor/connect, tuner tools.
+- **Phone** — "find my phone" opens Find My; send it a link/file/note over KDE Connect (Linux; an iPhone has to have the app open).
 
 ---
 
@@ -46,7 +48,7 @@ Grouped by theme, roughly in priority order within each group.
 The loop engine opened this up. Build outward from it.
 
 - **Learned / replayable routines ("neural pathway").** Generalize `web_automation_context` beyond the browser: cache a proven multi-step routine, score confidence from run history, self-heal by promoting working fallbacks. Repeat runs replay the saved routine instead of re-planning. Builds directly on the loop engine + task layer.
-- **Desktop GUI automation.** Mouse/keyboard control (`pyautogui`/Win32 `SendInput`) plus vision that returns **coordinates/regions** (Gemini grounding) or, better, the **Windows UI Automation tree** (`pywinauto`/`uiautomation`) for selector-style targeting instead of brittle pixels. Plugs into the loop engine as a new action type. Heavy, brittle, safety-gated — its own spec.
+- **Desktop GUI automation, next steps.** Click/type/keys shipped (vision-targeted). Next: selector-style targeting from the accessibility tree (AT-SPI on Linux, UI Automation on Windows) where apps expose it, multi-step "do this in the app" routines, and a loop-engine action type.
 - **Expand the loop registry.** More curated actions/checks: retry-any-safe-tool, wait-for-file, wait-for-process-exit, wait-for-window, disk/CPU threshold. Keep it non-destructive by default.
 - **Shell with confirmation.** Strict command allowlist, run visibly, task-mode only. Precondition for many autonomy tasks.
 
@@ -58,7 +60,6 @@ The loop engine opened this up. Build outward from it.
 
 ### 3. Depth on existing skills
 
-- **Spotify** — current-track query, queue management.
 - **Google** — finish OAuth setup (`credentials.json`); Gmail/Calendar **write** actions behind the confirmation flow.
 - **WhatsApp** — read capability via browser automation (currently draft-only).
 - **Screen reading** — polish prompt handling; hand back structured/coordinate info to feed desktop automation.

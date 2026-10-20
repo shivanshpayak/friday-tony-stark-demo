@@ -41,7 +41,7 @@ flowchart TB
     FP -->|"matched → run action,<br/>stay asleep"| SPK
     HK -.->|"Ctrl+Alt+Space (PTT)"| AL
     P1 -->|"stdin protocol:<br/>START / START_RECOVERED / PREPARE /<br/>GREET / ABORT / QUIT / INTERRUPT"| P2
-    P2 -->|"stdout signals:<br/>FRIDAY_READY / SESSION_STARTED /<br/>SESSION_LISTENING / SESSION_DONE / SESSION_FATAL /<br/>PROCESSING / SPEAKING / TURN_IDLE"| P1
+    P2 -->|"stdout signals:<br/>FRIDAY_READY / SESSION_STARTED /<br/>SESSION_LISTENING / SESSION_DONE / SESSION_FATAL /<br/>PROCESSING / SPEAKING / TURN_IDLE /<br/>ANNOUNCE_DONE / SCHEDULED_FIRED"| P1
     P2 <-->|"stdio MCP<br/>(JSON-RPC)"| P3
     SESS --> SPK(["🔊 Speaker (TTS)"])
 
@@ -56,7 +56,7 @@ of the recovery feature (§5).
 
 Process comms:
 - **Launcher → Agent:** writes commands to the agent's **stdin** (`START`, `START_RECOVERED`, `PREPARE`, `GREET`, `ABORT`, `QUIT`, `INTERRUPT`). `PREPARE` starts **silent** prep (STT reconnect, no speech, no mic) the instant the wake word fires, so it overlaps the launcher's fast-path tail capture; it is then completed by `GREET` (speak the ready line, open the mic) or cancelled by `ABORT` (a fast-path command handled the request, or the speaker failed verification — no session begins, no `SESSION_DONE`). `START` is `PREPARE`+`GREET` in one, still used by the PTT and fatal-recovery paths. If no `GREET`/`ABORT` arrives within `PREPARE_WAIT_TIMEOUT` (5s), the agent aborts rather than sitting half-activated.
-- **Agent → Launcher:** prints **stdout signals** the launcher parses (`FRIDAY_READY`, `SESSION_STARTED`, `SESSION_LISTENING`, `SESSION_DONE`, `SESSION_FATAL`, `PROCESSING`, `SPEAKING`, `TURN_IDLE`). Overlay: `PROCESSING` → "Thinking...", `SPEAKING` → speaking bars, `TURN_IDLE` (an LLM turn ended with nothing said and no tool to run — e.g. the prompt's silence after a successful action, or a failed LLM call) → back to listening.
+- **Agent → Launcher:** prints **stdout signals** the launcher parses (`FRIDAY_READY`, `SESSION_STARTED`, `SESSION_LISTENING`, `SESSION_DONE`, `SESSION_FATAL`, `PROCESSING`, `SPEAKING`, `TURN_IDLE`, `ANNOUNCE_DONE`, `SCHEDULED_FIRED {json}`). Overlay: `PROCESSING` → "Thinking...", `SPEAKING` → speaking bars, `TURN_IDLE` (an LLM turn ended with nothing said and no tool to run — e.g. the prompt's silence after a successful action, or a failed LLM call) → back to listening. The last two come only while no session is open, after the agent spoke unprompted: `ANNOUNCE_DONE` (a background task's result) and `SCHEDULED_FIRED` (a timer, reminder or alarm, with its kind, message, due time and label) hand the overlay back to the launcher — which hides it, or for a fresh timer or an alarm rings it (§3). Without them the overlay stayed on "speaking" until the next session.
 - **Agent ↔ MCP server:** `MCPServerStdio` spawns `server.py` as a child; tools are called over stdio JSON-RPC.
 
 ---
@@ -122,6 +122,8 @@ stateDiagram-v2
     Responding --> Listening: reply done
     Listening --> Sleeping: dismissal ("that'll be all") → SESSION_DONE
     Responding --> Sleeping: dismissal
+    Sleeping --> Alarm: timer / alarm fires while idle (SCHEDULED_FIRED)
+    Alarm --> Sleeping: stop phrase / snooze / PTT / 5 min unanswered
 ```
 
 - **Activation** requires the enrolled voice at the **wake word** (launcher's speaker
@@ -156,6 +158,72 @@ stateDiagram-v2
   back as soon as JARVIS stops talking.
 - The **per-transcript** speaker gate inside the session is currently **OFF**
   (`SESSION_SPEAKER_GATE_ENABLED = False`) — see §4 and §6.
+
+### Alarm — a timer or clock alarm firing while idle
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler (agent)
+    participant A as Agent session
+    participant L as Launcher
+    S->>S: collect_due: repeating alarm → back on for its next day; missed alarm (>5 min late) → skipped
+    S->>A: timer / alarm due, nobody in a session
+    A->>A: speak its line (mic stays gated)
+    A->>L: SCHEDULED_FIRED {kind, message, fire_at, label}
+    Note over L: alarm.should_ring? fresh timer or alarm → State.ALARM
+    L->>L: overlay.show() · music ducked to 25% · dim chime loops (runtime/alarm.wav)
+    loop until stop/snooze phrase / PTT / ALARM_MAX_SECONDS
+        L->>L: wake-word mic → webrtcvad → Vosk (stop-phrase grammar)
+    end
+    L->>L: chime cut · music restored · overlay.hide() · wakeword.reset() → SLEEPING
+    opt heard "snooze"
+        L->>S: alarm.snooze → one-time alarm in ALARM_SNOOZE_MINUTES (scheduled.json)
+    end
+```
+
+- **Clock alarms** (`set_alarm(time, repeat, label)`, `switch_alarm(label_or_id, on)`
+  in `friday/tools/scheduler.py`): the Windows Clock alarm by voice — a time of day,
+  repeating on chosen weekdays ("weekdays", "mon wed fri", "mon-thu") or once, and an
+  on/off switch that keeps it saved (`"all"` switches every alarm, for a break).
+  Parsing and next-occurrence math are pure functions in
+  `friday/scheduling/recurrence.py`. Stored as `kind="alarm"` items in
+  `runtime/scheduled.json` with `repeat` (weekday numbers) and `enabled`; after it
+  fires, a repeating alarm's `fire_at` moves to its next day instead of being
+  removed. One due more than `ALARM_MISSED_SECONDS` ago (laptop asleep, JARVIS off)
+  is skipped without a word, as in Windows — and still rings on its next day.
+- **Snooze:** "snooze" (`ALARM_SNOOZE_PHRASES`) in the stop grammar stops the ring
+  and writes a one-time alarm `ALARM_SNOOZE_MINUTES` (10) out, labelled
+  "snoozed <label>" so cancelling the repeating one by its label can't hit it.
+
+- **Only stop phrases are input.** The agent's mic stays gated; the launcher
+  decodes the wake-word stream with the fast path's Vosk model under a grammar of
+  `ALARM_STOP_PHRASES` (the dismissal phrases plus "stop", "thank you", "shut up"…)
+  and `[unk]`, matched as whole words. Free and offline — no STT or LLM call.
+  `hey jarvis` is in the grammar as a **decoy**: "goodbye jarvis" puts "jarvis" in
+  it, and without the decoy 1 of 8 recorded wake clips decoded as "goodbye jarvis".
+  Checked offline against all 40 recorded wake clips and the chime at 0.5×–4× gain:
+  no false stops.
+- **Not rung:** reminders (said once), timers more than `ALARM_STALE_SECONDS` overdue
+  (came due while JARVIS was off — fired on the first tick after boot), and anything
+  in quiet mode, where the agent doesn't speak it either and the launcher shows a
+  **sticky** notification instead (critical urgency — stays until dismissed; also
+  used when an alarm goes unanswered). Mid-conversation a timer or alarm is just
+  said, as before.
+- **Chime:** a soft two-note bell built at each launcher boot (`alarm.build_clip`,
+  peak `ALARM_VOLUME` of full scale) and looped by `alarm.Ringer`; stopping it kills
+  the player mid-clip (`plat.stop_sound`).
+- **Music ducks while it rings** (`media_control.duck_playback` / `unduck_playback`):
+  every playing stream drops to `ALARM_DUCK_TO` (25%) of its volume and gets its
+  exact per-channel volume back when the alarm stops. Spared: JARVIS's own
+  processes — its voice is an ALSA stream with no pid of its own, so the pid comes
+  from its PipeWire client — and its chime players (`pw-play`/`paplay`/`aplay`):
+  PipeWire remembers each app's volume, so a ducked chime that ended before the
+  restore would leave every later chime quiet. A stream whose volume was changed by
+  hand mid-alarm is left where it was put. Windows does the same through pycaw
+  sessions (untested there).
+- Push-to-talk during an alarm stops it instead of waking. With no Vosk model, the
+  wake word stops it instead of a phrase. Unanswered for `ALARM_MAX_SECONDS` (5 min),
+  it stops on its own and leaves a notification.
 
 ### Fast path — commands that never reach the agent
 
@@ -285,8 +353,9 @@ selected at import time — nothing on the latency path changed.
 | Visible task terminal | `CREATE_NEW_CONSOLE` | `konsole --hold -e` (fallbacks) | `plat.open_terminal` |
 | Clipboard | Win32 API | `wl-copy`/`wl-paste`, Klipper D-Bus fallback | `friday/tools/clipboard.py` |
 | Screenshot | `ImageGrab` | `spectacle --background` (Wayland blocks direct grabs) | `plat.grab_screen` |
+| Click / type / keys / scroll | `pyautogui` | Remote Desktop portal (Wayland lets no other program inject input); one-time KDE approval, kept via a restore token; see §7 Desktop control | `friday/desktop_input.py` |
 | Volume / mute | pycaw | `wpctl` (master), `pactl` sink-inputs (per-app) | `friday/media_control.py` |
-| Media transport, now-playing | media keys, Spotify window title | MPRIS over D-Bus (`busctl --user`) | `friday/media_control.py` |
+| Media transport, now-playing | media keys, Spotify window title | MPRIS over D-Bus (`busctl --user`) | `friday/media_control.py` (Spotify Web API first when signed in: `friday/spotify.py`) |
 | App launch / close | Start Menu `.lnk`, `taskkill` | `.desktop` entries, SIGTERM by process name | `friday/tools/apps_linux.py` |
 | WPILib editor's installed name | `2026 WPILib VS Code` | `FRC VS Code 2026` | `APP_DISCOVERED_ALIASES` (`friday/config.py`), checked first by both `_resolve`s |
 | Speaker fingerprint | `voice_embedding.windows.npy` | `voice_embedding.linux.npy` | `plat.voice_embedding_path`, `enroll_voice.py` |
@@ -296,6 +365,7 @@ selected at import time — nothing on the latency path changed.
 | Wallpaper pulses to music | — | subprocess reads the default output's monitor (`parec`) only while asked, finds bass onsets, long poll `GET http://127.0.0.1:47812/music?after=<beat>` | `friday/music_pulse.py`, `_SubprocessOverlay.start` |
 | Wallpaper sky: timers, tasks, notifications | — | subprocess watches `runtime/scheduled.json`, `runtime/tasks/active/`, and Notify calls (`dbus-monitor --profile`, no contents); long poll `GET http://127.0.0.1:47813/sky?after=<seq>` | `friday/sky_feed.py`, `_SubprocessOverlay.start` |
 | Focus mode | — | `start_focus` / `end_focus`: closes `FOCUS_CLOSE_APPS`, pauses every MPRIS player, plays `FOCUS_PLAYLIST`, writes `runtime/focus.json` + a `focus` timer; the sky feed holds KDE's notification inhibition while it's on (auto-lifted if the feed dies); the timer's fire speaks a recap | `friday/focus.py`, `friday/tools/focus.py`, `agent_friday._scheduled_fire_instructions` |
+| Send to phone (link/file/note) | — | kdeconnectd over D-Bus (`busctl --user`); see §7 Phone | `friday/phone.py`, `friday/tools/phone.py` |
 | Autostart / relaunch | Task Scheduler, `start_friday.vbs` | `~/.config/autostart/jarvis.desktop`, `start_friday.sh` | `install_startup.py` |
 | Reboot into the other OS | elevated Task Scheduler task `JARVIS Restart into Linux` (UEFI one-shot via `bcdedit`, then restart) | root helper `boot-windows-next` (UEFI one-shot via `efibootmgr`) + KDE logout | `plat.restart_into`, `install_boot_switch.py`, `boot-switch/` |
 
@@ -352,8 +422,10 @@ Linux gotchas:
 ## 6b. Quiet mode and typed requests
 
 **Quiet mode** (`friday/quiet.py`, state in `runtime/quiet.json`) means JARVIS
-makes no sound: the launcher drops wake-word hits and push-to-talk, and a fatal
-close recovers without the spoken recovery line. It is on automatically while
+makes no sound: the launcher drops wake-word hits and push-to-talk, a fatal
+close recovers without the spoken recovery line, and a timer, reminder or alarm that
+fires while idle is a desktop notification instead of a spoken line and ring (one
+that stays until dismissed, for a timer or alarm). It is on automatically while
 the laptop is on a Wi-Fi network marked as school (`friday_ctl school add`). A
 manual `friday_ctl quiet on|off` overrides that, but only while the laptop stays
 on the network it was set on, so a "you may talk" granted once can't leak into
@@ -514,7 +586,8 @@ understanding why** — each cost a long debugging trail.
 | **Google TTS grpc channel warmup** | pre-warm block after providers | grpc establishes the HTTP/2 connection lazily on first synthesis, under session load, and hangs. Warming `list_voices()` at boot connects it early. |
 | **Console APM forced OFF** | `_force_console_apm_off` | livekit's console `AudioProcessingModule` (AEC+NS+AGC) stripped the user's voice to the noise floor → STT got silence → no transcripts. Escape hatch: `FRIDAY_KEEP_APM=1`. |
 | **Echo guard** | `discard_audio_if_uninterruptible=True` | With APM + speaker gate off, prevents transcribing the agent's own TTS. |
-| **Turns start and end on words, not sound** | `friday/turn_end.py` — wrapped around the STT events in `FridayAgent.stt_node`; `STT_WORD_SILENCE_END` (config) | Deepgram's endpoint (`speech_final`) needs 300ms of silence and its `SpeechStarted` comes from an audio VAD. A fan is steady noise: the silence never came, so a finished request sat unanswered until the mic was muted, and a noise-triggered `START_OF_SPEECH` right after a turn ended cancelled the pending reply. The wrapper drops Deepgram's start events and emits `START_OF_SPEECH` at the first transcript with text; it ends the turn at Deepgram's endpoint *or* once the transcript has gone 1.0s without changing, whichever is first. Under noise Deepgram also withholds the *final* transcript for seconds, so a stable interim is promoted to final and Deepgram's late final for the same words is dropped. Measured against Deepgram with fan-like noise: turn ended 0.7s after the last word, versus never. Quiet-room timing is unchanged. |
+| **Turns start and end on words, not sound** | `friday/turn_end.py` — wrapped around the STT events in `FridayAgent.stt_node`; `STT_WORD_SILENCE_END` (config) | Deepgram's endpoint (`speech_final`) needs 300ms of silence and its `SpeechStarted` comes from an audio VAD. A fan is steady noise: the silence never came, so a finished request sat unanswered until the mic was muted, and a noise-triggered `START_OF_SPEECH` right after a turn ended cancelled the pending reply. The wrapper drops Deepgram's start events and emits `START_OF_SPEECH` at the first transcript with text; it ends the turn at Deepgram's endpoint *or* once the transcript has gone 1.3s without changing (`STT_WORD_SILENCE_END`; 1.0 cut him off mid-thought), whichever is first. When the words so far stop on one that leaves the sentence hanging ("Play", "until you get to", "goes like" — `_UNFINISHED`), it waits 2.5s instead (`STT_UNFINISHED_SILENCE_END`) and holds Deepgram's endpoint too; a lone "Play" used to toggle the music. Each save is logged as `Waited past ... and he went on`. Under noise Deepgram also withholds the *final* transcript for seconds, so a stable interim is promoted to final and Deepgram's late final for the same words is dropped. Measured against Deepgram with fan-like noise: turn ended 0.7s after the last word, versus never. Quiet-room timing is unchanged. Deepgram also re-reports audio it already transcribed, up to ~8s later and often with a word or two more in front ("are of Set a timer for thirty minutes." set a second timer). Words carry audio times, so words for audio already passed on as final are cut — but only when most of them repeat words heard in the last 15s, because a reconnected stream restarts its clock at zero. A real repeat (new audio) still passes. Each cut is logged as `STT went back over words already handled`. |
+| **Jarvis doesn't answer his own "sir"** | `_is_own_echo` / `_drop_own_echo` (agent_friday.py), wrapped around the STT events in `FridayAgent.stt_node`, before `end_turn_on_words` | The mic reopens while the last word of a reply is still coming out of the speakers, and nearly every reply ends in "sir". Deepgram heard "Sir?" as the user, the reply ("Yes, sir?") ended in "sir" again, and the two fed each other every ~3.5s until he gave up (logs: 16 such turns in one session). Interim and final transcripts made only of "sir" are dropped (he never says just that to Jarvis), so the echo can't start a turn either. A text filter, not a longer mic hold-off: costs no reaction time. Guarded by `tests/test_own_echo.py`. |
 | **A spoken reply gets time to finish** | `TTS_STREAM_TIMEOUT` / `TTS_FIRST_AUDIO_TIMEOUT` (config) → `build_session_conn_options`, `_first_within` (agent_friday.py) | livekit's default 10s TTS timeout is applied by the Google plugin as the deadline for the *whole* streaming call, so any reply that took over ~10s to synthesise was cut off mid-sentence, followed by retries that could only fail ("no audio frames were pushed" — the text was already consumed) and an error counted toward closing the session. The stream now has 180s; a TTS that never starts is caught by a 15s wait for the first audio only; TTS retries are off. |
 | **TTS padding silence is cut** | `friday/tts_trim.py` — `FridayAgent.tts_node` (live replies), `PrerenderedLines.ensure` (wake lines) | Gemini TTS pads every utterance with 160–210ms of silence before the first word and 390–480ms after the last. The mic is closed while the agent speaks and, after a wake, opens only when the ready line ends — so that padding was dead air before the user could talk. Both ends are cut (20ms lead / 150ms tail kept; pauses inside a reply untouched): ~0.4s off every wake→listening, replies audible ~0.15s sooner, mic back ~0.25s sooner. The 150ms tail is deliberate — it covers the sound card draining its buffer, so the agent doesn't hear its own last word. |
 | **Speaker encoder is plain numpy** | `friday/voice_encoder.py` (+ `voice_encoder.npz`) | Resemblyzer's network is a 3-layer LSTM, but importing it loaded torch, librosa, numba and llvmlite: **~265 MB** resident in the launcher and a ~4.6s JIT on the first embedding (which once stalled the first wake word past `PREPARE_WAIT_TIMEOUT`). The same weights now run in numpy — identical embeddings (so enrolled fingerprints stay valid), ~20ms per clip, no warmup. `tests/test_voice_encoder.py` pins the output to a Resemblyzer reference. |
@@ -543,33 +616,95 @@ keeps a small core surface warm and routes heavier domains in on demand.
 flowchart TB
     LLM["LLM (Gemini)"] --> POOL["Domain tool pool<br/>(core always warm)"]
     POOL --> MCP["server.py (FastMCP)"]
-    MCP --> SYS["system · apps · sysmon · network · clipboard"]
+    MCP --> SYS["system · apps · sysmon · network · clipboard · desktop"]
     MCP --> MEDIA["media · audio"]
     MCP --> INFO["weather · maps · web · web_automation · screen"]
     MCP --> PROD["files · calculate · memory · scheduler"]
     MCP --> COMMS["messaging · google_suite"]
     MCP --> DELEG["claude_delegate (background tasks)"]
     MCP --> FRC["frc · frc_tuner (robotics)"]
+    MCP --> PHONE["phone (KDE Connect · Find My)"]
 ```
 
 | Domain | Modules | What it does |
 |--------|---------|--------------|
-| System | `system`, `apps`, `sysmon`, `network`, `clipboard` | launch apps, system control, CPU/mem, IP/geo, clipboard |
-| Media | `media`, `audio` | play/pause/volume, audio devices. Control primitives live in `friday/media_control.py` (no MCP imports) and are shared with the launcher fast path (§3) |
+| System | `system`, `apps`, `sysmon`, `network`, `clipboard`, `desktop` | launch apps, system control, CPU/mem, IP/geo, clipboard, **desktop control** (`click_on_screen`, `type_text`, `press_keys`) |
+| Media | `media`, `audio` | **music via the Spotify Web API** ([`friday/spotify.py`](friday/spotify.py), PKCE sign-in once per OS: `uv run python -m friday.spotify login`): `play_music` (track/playlist/album/artist, his own playlists first, ranked by title/artist match since search has no popularity), `queue_song`, `like_current_song`, `current_track`. `lyrics=` → song name via Gemini + Google Search ([`friday/lyrics.py`](friday/lyrics.py)). Not signed in → web search for the link, played via MPRIS `OpenUri` on Linux. Play/pause/volume, audio devices: control primitives live in `friday/media_control.py` (no MCP imports) and are shared with the launcher fast path (§3) |
 | Info / vision | `weather`, `maps`, `web`, `web_automation`, `screen` | forecasts, directions, search, browser automation, **pull-up** (`open_on_screen`: URL/search/file), screen reading — single view (`read_screen`) and **scroll-and-read past the viewport** (`read_long_content`, Gemini vision) |
-| Productivity | `files`, `calculate`, `memory`, `scheduler` | file ops, math, persistent prefs, timers/reminders |
+| Productivity | `files`, `calculate`, `memory`, `scheduler` | file ops, math, persistent prefs, timers/reminders (`set_timer(minutes, seconds)` — both fractional, so "thirty seconds" works; it was `minutes: int` and Gemini's `minutes=0.5` failed validation), clock alarms (`set_alarm(time, repeat, label)`, `switch_alarm` — §3 "Alarm") |
 | Comms | `messaging`, `google_suite` | messages, Gmail/Calendar/Drive |
 | Background | `claude_delegate` | hands slow/multi-step work to a background Claude executor |
 | Robotics | `frc`, `frc_tuner` | FRC build/sim/dashboard, NetworkTables PID tuning |
+| Phone | `phone` | `find_my_phone` opens Find My (both OSes); `send_to_phone` sends a link, file or note over KDE Connect (Linux). Plumbing in `friday/phone.py` (no MCP imports) |
 
 **Screen reach & read:** `open_on_screen` ([`friday/tools/web.py`](friday/tools/web.py))
 pulls up a URL, a Google search, or a local file/folder (files bounded to
 `FRIDAY_FILE_ROOTS` via files.py's `_resolve_and_check`). `read_long_content`
 ([`friday/tools/screen.py`](friday/tools/screen.py)) reads content past the
-viewport: it scrolls the active window (`pyautogui`) and captures frames until they
+viewport: it scrolls the active window (`friday/desktop_input.py`) and captures frames until they
 stop changing ([`friday/screen_scroll.py`](friday/screen_scroll.py), capped at 12
 scrolls), then sends the sequence to Gemini vision as one multi-image call and
 answers over all of it. `read_screen` remains the single-visible-screen path.
+
+**Desktop control:** `click_on_screen` / `type_text` / `press_keys`
+([`friday/tools/desktop.py`](friday/tools/desktop.py)). A click target is
+described, not given as coordinates: `locate_on_screen`
+([`friday/tools/screen.py`](friday/tools/screen.py)) screenshots the desktop and
+asks `gemini-3.5-flash` (thinking off) for the thing's `box_2d`; the click goes
+to its centre, as a fraction of the whole desktop. Measured on Kate's toolbar,
+3.5-flash landed 14/14 targets within a few pixels in ~1.3s, where 2.5-flash
+missed most by 20–90px. A click costs ~2–3s (screenshot + vision); keys and
+typing are immediate. [`friday/desktop_input.py`](friday/desktop_input.py) puts
+the input in: on Windows `pyautogui`; on Wayland, which lets no program inject
+input into another's windows, the **Remote Desktop portal** over jeepney.
+
+```mermaid
+sequenceDiagram
+    participant T as desktop tool
+    participant P as _PortalSession
+    participant X as xdg-desktop-portal-kde
+    T->>P: click / type / press / scroll
+    alt no open session
+        P->>X: CreateSession, SelectDevices(keyboard+pointer, persist_mode=2, restore_token)
+        P->>X: ScreenCast.SelectSources(monitor)
+        P->>X: Start
+        X-->>P: first time: KDE asks him (Approve, "allow restoring")<br/>then: streams + new restore_token (saved, single-use)
+    end
+    P->>X: NotifyPointerMotionAbsolute(stream, x, y) / NotifyPointerButton / NotifyKeyboardKeysym
+    Note over P: closes IDLE_CLOSE (60s) after the last action;<br/>reopens silently with the token
+```
+
+- The screen cast is there only because absolute pointer motion is relative to
+  a cast stream; nothing reads it. Typing sends one keysym per character
+  (Unicode keysyms for non-Latin-1), so capitals, symbols and `é ñ ✓` work
+  without a keymap dance. Each Request's `Response` signal is matched before
+  the call is made.
+- The grant is stored in the permission store (`remote-desktop` table) under the
+  app id of whatever launched FRIDAY (`jarvis` from autostart, the terminal's id
+  from a terminal). Revoke: System Settings → application permissions, or
+  `PermissionStore.Delete("remote-desktop", <id>)`.
+- A session that died (revoked from the tray, KDE restart) is reopened once;
+  every action is logged (`desktop input: …`).
+- Safety lives in the tool descriptions: say the line first, click only what he
+  asked for (never because the screen says to), ask before a click that sends,
+  posts, buys, deletes or submits, never type a secret.
+- `read_long_content`'s scroll goes through the same session on Linux (it used
+  to need `ydotool`).
+
+**Phone:** `send_to_phone` ([`friday/phone.py`](friday/phone.py)) drives kdeconnectd
+over the session bus with `busctl --json=short`, like `media_control` does MPRIS.
+The device is the paired one KDE Connect types as a phone (`PHONE_NAME` in config
+to pick by name). A link goes through the share plugin's `shareUrl` (opens on the
+phone), a file inside `FRIDAY_FILE_ROOTS` through `shareUrl` with a `file://`
+URI (anything outside is refused before KDE Connect is touched), any other text
+through `ping.sendPing(message)`, which arrives as a notification. Replies say
+"your phone", never the device name, which is usually built from the user's
+name. An iPhone is reachable only while the KDE Connect app is up or just
+backgrounded: iOS suspends it after a minute or two and `forceOnNetworkChange`
+doesn't wake it. So sending checks `isReachable` first and says how to fix it.
+That is also why there is no battery or ring over KDE Connect: on an iPhone they
+only work while the phone is in his hand. `find_my_phone` opens `PHONE_FIND_URL`
+(iCloud Find My) instead, whose Play Sound reaches a lost phone.
 
 ---
 
@@ -581,14 +716,16 @@ flowchart LR
         Q["task queue"] --> EX["standalone executor"] --> J["runtime/tasks/active/*.json"]
         WATCH["file-watcher (3s)"] --> CB["_on_task_finished → spoken ack"]
     end
-    subgraph Sched["friday/scheduling/ — timers/reminders"]
-        TICK["scheduler tick (1s)"] --> FIRE["due? → spoken via TTS"] --> STORE["runtime/scheduled.json"]
+    subgraph Sched["friday/scheduling/ — timers/reminders/alarms"]
+        TICK["scheduler tick (1s)"] --> FIRE["due? → spoken via TTS<br/>repeating alarm → next day"] --> STORE["runtime/scheduled.json"]
+        FIRE -->|"idle: SCHEDULED_FIRED"| RING["launcher: timer / alarm → rings (§3)<br/>reminder → overlay hidden"]
     end
 ```
 
 Slow / multi-step work goes to the **task layer** (quick spoken ack now, result spoken
-later) so it never blocks the reply path. Timers and reminders fire through the same
-session's TTS.
+later) so it never blocks the reply path. Timers, reminders and alarms fire through
+the same session's TTS; when no session is open, a fresh timer or an alarm then rings
+until stopped (§3, "Alarm").
 
 **Loop-until-success engine** ([`friday/looping/`](friday/looping/)): a background,
 bounded, cancellable "do X until Y" runner. `run_until` (MCP, in
@@ -619,13 +756,18 @@ switch cancel them. Generalizes the hardcoded `monitor_wifi_connection` loop.
 | Pre-rendered wake lines (no LLM/TTS on wake) | `friday/voice_cache.py` → `runtime/voice_cache/*.wav` |
 | Fast-path voice commands (launcher, no LLM) | `friday/fastpath/` — command table in `registry.py` |
 | Shared media control (volume, mute, transport) | `friday/media_control.py` |
+| Spotify Web API (search, play, queue, like; token in `runtime/spotify_token.json`) | `friday/spotify.py` |
+| Song from lyrics (Gemini + Google Search) | `friday/lyrics.py` |
 | Vosk model (fast path, ~40MB, gitignored) | `models/vosk-model-small-en-us-0.15/` |
 | Tools (features) | `friday/tools/*.py` |
 | Tool routing / domain pool | `friday/routing/` |
 | Background tasks | `friday/tasking/` |
 | Loop-until-success engine ("do X until Y") | `friday/looping/` + `friday/tools/loops.py` |
 | Scroll-capture engine (read past the viewport) | `friday/screen_scroll.py` + `read_long_content` in `friday/tools/screen.py` |
-| Timers & reminders | `friday/scheduling/` |
+| Timers, reminders & clock alarms | `friday/scheduling/` (repeat days: `recurrence.py`), tools in `friday/tools/scheduler.py` |
+| Alarm (timer/alarm ringing while idle; stop/snooze listener) | `friday/alarm.py` + `State.ALARM` in `friday_launcher.py` |
+| Phone (send over KDE Connect, find via Find My) | `friday/phone.py` + `friday/tools/phone.py` |
+| Desktop control (click / type / keys; portal session) | `friday/tools/desktop.py` + `friday/desktop_input.py` |
 | Runtime state (tasks, memory, schedules) | `runtime/` |
 | Speaker fingerprint (one per OS) | `voice_embedding.windows.npy` / `voice_embedding.linux.npy` |
 | Logs | `logs/friday.log` |

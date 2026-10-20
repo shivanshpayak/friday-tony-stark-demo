@@ -32,8 +32,10 @@ from friday_overlay import FridayOverlay
 from friday.recovery import (
     next_respawn_failures, respawn_backoff, should_announce_recovery,
 )
-from friday.config import FASTPATH_ENABLED, TEXT_TURN_TIMEOUT
-from friday import handoff, plat, quiet
+from friday.config import (
+    ALARM_DUCK_TO, ALARM_MAX_SECONDS, FASTPATH_ENABLED, TEXT_TURN_TIMEOUT,
+)
+from friday import alarm, handoff, plat, quiet
 from friday.voiceprint import clean_clip, save_clip
 
 _WIN = sys.platform == "win32"
@@ -201,6 +203,7 @@ AUDIO_RATE = 16000
 AUDIO_CHUNK = 1280  # 80ms at 16kHz
 CHIME_PATH = Path(__file__).parent / "sounds" / "activate.wav"
 BOOT_ACK_PATH = Path(__file__).parent / "sounds" / "booting_ack.wav"
+ALARM_CLIP_PATH = Path(__file__).parent / "runtime" / "alarm.wav"   # friday/alarm.py
 BOOT_ACK_TEXT = "Hello sir, give me a second to get everything booted up."
 BOOT_ACK_VOICE = os.getenv("LOCAL_TTS_VOICE", "").strip()
 try:
@@ -255,6 +258,7 @@ def _clear_pid_file() -> None:
 class State(Enum):
     SLEEPING = "sleeping"
     ACTIVE = "active"
+    ALARM = "alarm"      # a timer is ringing; only a stop phrase is listened for
 
 
 # ---------------------------------------------------------------------------
@@ -636,11 +640,18 @@ class AgentProcess:
         subprocess stdout → launcher:  FRIDAY_READY | SESSION_STARTED |
                                        SESSION_LISTENING | SESSION_DONE |
                                        SESSION_FATAL | PROCESSING | SPEAKING |
-                                       TURN_IDLE
+                                       TURN_IDLE | ANNOUNCE_DONE |
+                                       SCHEDULED_FIRED {json}
+
+    ANNOUNCE_DONE and SCHEDULED_FIRED come only while no session is open: the
+    agent said something unprompted (a background task's result, a timer or
+    reminder), so the overlay its PROCESSING/SPEAKING lines raised is the
+    launcher's to put away — or, for a timer or alarm, to keep up while it rings.
     """
 
     def __init__(self, on_processing=None, on_speaking=None, on_listening=None,
-                 on_fatal=None, on_idle=None):
+                 on_fatal=None, on_idle=None, on_announce_done=None,
+                 on_scheduled_fired=None):
         self._proc: subprocess.Popen | None = None
         self._ready = threading.Event()
         self._session_done = threading.Event()
@@ -653,6 +664,8 @@ class AgentProcess:
         self._on_listening = on_listening     # callback when mic is live again
         self._on_fatal = on_fatal             # callback on SESSION_FATAL (session died)
         self._on_idle = on_idle               # callback when a turn ends with nothing said
+        self._on_announce_done = on_announce_done      # unprompted line finished (idle)
+        self._on_scheduled_fired = on_scheduled_fired  # timer/reminder fired (idle), gets its dict
         # Typed requests awaiting TEXT_REPLY, keyed by request id.
         self._text_waiters: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Future]] = {}
         self._text_seq = 0
@@ -660,6 +673,15 @@ class AgentProcess:
     @property
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
+
+    @property
+    def pid(self) -> int | None:
+        return self._proc.pid if self._proc is not None else None
+
+    @property
+    def ready(self) -> bool:
+        """FRIDAY_READY seen (or the process is gone) — boot is over."""
+        return self._ready.is_set()
 
     @property
     def needs_respawn(self) -> bool:
@@ -752,6 +774,19 @@ class AgentProcess:
             # Checked first: the reply text is arbitrary and may itself contain
             # words like "SPEAKING" that the substring matches below look for.
             self._resolve_text_reply(stripped[len("TEXT_REPLY "):])
+        elif stripped.startswith("SCHEDULED_FIRED "):
+            # Also ahead of the substring matches: the timer's message is text.
+            try:
+                fired = json.loads(stripped[len("SCHEDULED_FIRED "):])
+            except ValueError:
+                logger.warning("Malformed SCHEDULED_FIRED from agent")
+                return
+            logger.info("Agent reports %s fired while idle", fired.get("kind"))
+            if self._on_scheduled_fired:
+                self._on_scheduled_fired(fired)
+        elif "ANNOUNCE_DONE" in stripped:
+            if self._on_announce_done:
+                self._on_announce_done()
         elif "FRIDAY_READY" in stripped:
             logger.info("Agent subprocess signalled FRIDAY_READY")
             self._ready.set()
@@ -1021,9 +1056,44 @@ async def launcher_loop():
     # close while this is clear (idle, awaiting wake word) recovers silently.
     session_active = threading.Event()
 
+    # Bound before the agent is spawned: its stdout callbacks below read it,
+    # and an overdue timer can fire during boot.
+    state = State.SLEEPING
+
     def _on_fatal():
         if should_announce_recovery(session_active=session_active.is_set()):
             pending_recovery_cue.set()
+
+    def _put_away_overlay():
+        # The agent spoke unprompted while idle; its PROCESSING/SPEAKING lines
+        # raised the overlay and nothing else would lower it. Not during boot:
+        # an overdue reminder fires then, and the overlay is the boot screen.
+        if state == State.SLEEPING and agent.ready:
+            overlay.hide()
+
+    # A fresh timer or an alarm that fired while idle is rung by the SLEEPING
+    # loop (State.ALARM); push-to-talk sets alarm_stop while it rings.
+    alarm_pending = threading.Event()
+    alarm_fired: list[dict] = [{}]
+    alarm_stop = threading.Event()
+
+    def _on_scheduled_fired(fired: dict):
+        # stdout reader thread — nothing here may block or raise.
+        message = str(fired.get("message") or "")
+        if alarm.should_ring(str(fired.get("kind", "")), str(fired.get("fire_at", ""))):
+            alarm_fired[0] = fired
+            alarm_pending.set()
+            return
+
+        def _said_once():
+            try:
+                if quiet.is_quiet():      # nmcli: off the reader thread
+                    plat.notify("JARVIS", message)
+            except Exception as e:
+                logger.warning("Scheduled-item notification failed: %s", e)
+            _put_away_overlay()
+
+        threading.Thread(target=_said_once, daemon=True).start()
 
     agent = AgentProcess(
         on_processing=lambda: overlay.show_loading("Thinking..."),
@@ -1031,6 +1101,8 @@ async def launcher_loop():
         on_listening=lambda: overlay.show(),
         on_fatal=_on_fatal,
         on_idle=lambda: overlay.show(),   # silent turn ended → back to listening
+        on_announce_done=_put_away_overlay,
+        on_scheduled_fired=_on_scheduled_fired,
     )
 
     overlay.start()
@@ -1075,6 +1147,111 @@ async def launcher_loop():
         agent.stop()
         overlay.stop()
         raise
+
+    # ---- Alarm: a timer that fires while idle rings (friday/alarm.py) -----
+    try:
+        alarm_seconds = alarm.build_clip(ALARM_CLIP_PATH)
+    except Exception as e:
+        logger.warning("Could not build the alarm chime (%s) — alarms ring silently", e)
+        alarm_seconds = 0.0
+    stop_listener = None
+    if fastpath is not None:
+        try:
+            stop_listener = alarm.StopListener(
+                fastpath.recognizer_factory(alarm.grammar()))
+        except Exception as e:
+            logger.warning("Alarm stop listener unavailable (%s)", e)
+    if stop_listener is None:
+        logger.warning("No offline recognizer — an alarm is stopped by "
+                       "'Hey Jarvis' or push-to-talk instead of a stop phrase")
+
+    def _wait_for_wake_word(done):
+        """The stop listener's stand-in when there is no Vosk model."""
+        while not done():
+            if wakeword.listen_once():
+                return "hey jarvis"
+        return None
+
+    def _duck_music() -> list:
+        """Turn down what's playing; JARVIS's own processes (its voice) are spared."""
+        from friday import media_control   # lazy: pycaw/comtypes on Windows
+
+        try:
+            ducked = media_control.duck_playback(
+                ALARM_DUCK_TO, frozenset(p for p in (os.getpid(), agent.pid) if p))
+        except Exception as e:
+            logger.warning("Could not lower the music for the alarm: %s", e)
+            return []
+        if ducked:
+            logger.info("Alarm: lowered %d playing stream(s) to %d%%",
+                        len(ducked), ALARM_DUCK_TO * 100)
+        return ducked
+
+    def _unduck_music(ducked: list) -> None:
+        from friday import media_control
+
+        try:
+            media_control.unduck_playback(ducked)
+        except Exception as e:
+            logger.warning("Could not restore the music after the alarm: %s", e)
+
+    async def _ring_alarm(fired: dict) -> None:
+        """Ring until a stop phrase, push-to-talk, or ALARM_MAX_SECONDS; a
+        snooze phrase stops it and has it ring again in ALARM_SNOOZE_MINUTES.
+
+        Nothing else said is acted on: the agent's mic stays gated, and the
+        launcher's recognizer can hear only the stop and snooze phrases.
+        """
+        message = str(fired.get("message") or "")
+        loop = asyncio.get_running_loop()
+        if await loop.run_in_executor(None, quiet.is_quiet):
+            # At school: no sound, but a notification that stays until dismissed.
+            logger.info("Alarm not rung — quiet mode")
+            plat.notify("JARVIS", message, sticky=True)
+            overlay.hide()
+            return
+        alarm_stop.clear()
+        overlay.show()
+        # Before the chime starts, so the chime itself is never turned down.
+        ducked = await loop.run_in_executor(None, _duck_music)
+        ringer = alarm.Ringer(ALARM_CLIP_PATH, alarm_seconds) if alarm_seconds else None
+        if ringer:
+            ringer.start()
+        deadline = time.monotonic() + ALARM_MAX_SECONDS
+
+        def done() -> bool:
+            return alarm_stop.is_set() or time.monotonic() >= deadline
+
+        heard = None
+        try:
+            if stop_listener is not None:
+                heard = await loop.run_in_executor(
+                    None, stop_listener.wait, wakeword.read_chunk, done)
+            else:
+                heard = await loop.run_in_executor(None, _wait_for_wake_word, done)
+        except Exception as e:
+            logger.warning("Alarm listening failed (%s) — stopping it", e)
+        finally:
+            if ringer:
+                ringer.stop()
+            await loop.run_in_executor(None, _unduck_music, ducked)
+            overlay.hide()
+            wakeword.reset()    # the listener read the stream past the wake model
+        if alarm.is_snooze(heard):
+            try:
+                at = await loop.run_in_executor(None, alarm.snooze, fired)
+            except Exception as e:
+                logger.warning("Snooze failed (%s) — alarm stopped instead", e)
+            else:
+                logger.info("Alarm snoozed until %s", at.strftime("%H:%M"))
+                plat.notify("JARVIS", f"Snoozed until {at.strftime('%I:%M %p').lstrip('0')}")
+        elif heard:
+            logger.info("Alarm stopped — heard %r", heard)
+        elif alarm_stop.is_set():
+            logger.info("Alarm stopped — push-to-talk")
+        else:
+            logger.info("Alarm stopped — unanswered")
+            plat.notify("JARVIS", message, sticky=True)
 
     # ---- Global hotkeys --------------------------------------------------
     # Registered on the OS hook, so they fire even when JARVIS isn't focused.
@@ -1150,6 +1327,9 @@ async def launcher_loop():
         if state == State.ACTIVE:
             logger.info("PTT pressed (%s) — interrupting active turn", PTT_HOTKEY)
             agent.send_interrupt()
+        elif state == State.ALARM:
+            logger.info("PTT pressed (%s) — stopping the alarm", PTT_HOTKEY)
+            alarm_stop.set()
         elif quiet.is_quiet():
             # A key can be bumped in class; only an explicit "quiet off" lets
             # JARVIS speak there.
@@ -1176,8 +1356,9 @@ async def launcher_loop():
                 response = await agent.ask(text) if text else {
                     "text": "", "error": "empty request"}
                 # The agent's PROCESSING/SPEAKING lines drove the overlay as if
-                # this were a voice turn; put it away again unless one is live.
-                if state != State.ACTIVE:
+                # this were a voice turn; put it away again unless one is live
+                # (or an alarm is ringing).
+                if state == State.SLEEPING:
                     overlay.hide()
             elif command == "status":
                 # Polled every couple of seconds by the tray: cached SSID.
@@ -1196,7 +1377,6 @@ async def launcher_loop():
             writer.close()
 
     control_server = None
-    state = State.SLEEPING   # read by the control socket before the loop starts
     if not _WIN:
         try:
             CONTROL_SOCKET.parent.mkdir(parents=True, exist_ok=True)
@@ -1250,7 +1430,7 @@ async def launcher_loop():
                     task, str(outcome), greet=index == 0), announce=True)
                 logger.info("Handoff confirmation: %s",
                             said.get("text") or said.get("error"))
-            if state != State.ACTIVE:
+            if state == State.SLEEPING:
                 overlay.hide()
 
     handoff_task = asyncio.create_task(_run_handoff_tasks())   # noqa: F841
@@ -1303,6 +1483,12 @@ async def launcher_loop():
                         state = State.ACTIVE
                         logger.info("State → ACTIVE (recovery)")
                         continue
+
+                # A timer or alarm went off while idle: ring it.
+                if alarm_pending.is_set():
+                    state = State.ALARM
+                    logger.info("State → ALARM")
+                    continue
 
                 # Push-to-talk has priority — explicit user action skips
                 # both wake-word match and speaker verification.
@@ -1417,6 +1603,16 @@ async def launcher_loop():
                 wakeword.reset()
                 wakeword.start_stream()
                 ptt_event.clear()  # discard any presses during the session
+                alarm_pending.clear()  # the user was there to hear it
+                state = State.SLEEPING
+                logger.info("State → SLEEPING")
+
+            elif state == State.ALARM:
+                alarm_pending.clear()
+                await _ring_alarm(alarm_fired[0])
+                # One stop silences every timer that went off while it rang
+                # (their lines were already spoken).
+                alarm_pending.clear()
                 state = State.SLEEPING
                 logger.info("State → SLEEPING")
 

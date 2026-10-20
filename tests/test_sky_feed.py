@@ -38,6 +38,21 @@ def test_reminders_join_only_near_the_end(tmp_path):
     assert soon["end"] - soon["start"] == pytest.approx(15 * 60, abs=1)   # not two hours
 
 
+def test_alarms_join_near_the_end_and_never_while_switched_off(tmp_path):
+    month_ago = _iso(-30 * 86400)
+    path = _scheduled(tmp_path, [
+        {"id": "soon", "kind": "alarm", "created_at": month_ago, "fire_at": _iso(300),
+         "repeat": [0, 1, 2, 3, 4], "enabled": True},
+        {"id": "tomorrow", "kind": "alarm", "created_at": month_ago, "fire_at": _iso(86400),
+         "repeat": [0, 1, 2, 3, 4], "enabled": True},
+        {"id": "off", "kind": "alarm", "created_at": month_ago, "fire_at": _iso(300),
+         "repeat": [], "enabled": False},
+    ])
+    [soon] = read_timers(path, time.time())
+    assert soon["id"] == "soon"
+    assert soon["end"] - soon["start"] == pytest.approx(15 * 60, abs=1)   # not a month
+
+
 def test_a_broken_store_is_an_empty_sky(tmp_path):
     path = tmp_path / "scheduled.json"
     path.write_text("{not json")

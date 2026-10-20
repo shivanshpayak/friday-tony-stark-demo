@@ -16,6 +16,7 @@ import sys
 
 import pytest
 
+from friday import alarm
 from friday.fastpath import registry
 from friday.fastpath.model import MODEL_DIR
 
@@ -69,4 +70,16 @@ def test_every_registry_phrase_is_in_vocabulary():
             f"Out-of-vocabulary words in the fast-path grammar: {owners}. "
             "Vosk drops these silently, so those commands can never match. "
             "Pick different wording in friday/fastpath/registry.py."
+        )
+
+
+@requires_model
+def test_every_alarm_stop_phrase_is_in_vocabulary():
+    """The alarm's stop listener uses the same model (friday/alarm.py)."""
+    missing = _missing_words(alarm.grammar())
+    if missing:
+        pytest.fail(
+            f"Out-of-vocabulary words in the alarm's stop phrases: {missing}. "
+            "Vosk drops these silently, so those phrases can never stop an alarm. "
+            "Reword them in ALARM_STOP_PHRASES (friday/config.py)."
         )

@@ -78,8 +78,19 @@ class TailRecognizer:
 
         return KaldiRecognizer(self._model, SAMPLE_RATE, self._grammar)
 
+    def recognizer_factory(self, phrases: list[str]):
+        """A zero-arg maker of recognizers that can hear only `phrases`.
+
+        Shares this model, so the alarm's stop listener (friday/alarm.py)
+        costs no second load of it.
+        """
+        from vosk import KaldiRecognizer
+
+        grammar = json.dumps(phrases)
+        return lambda: KaldiRecognizer(self._model, SAMPLE_RATE, grammar)
+
     @staticmethod
-    def _chunk_is_voiced(vad, raw: bytes) -> bool:
+    def chunk_is_voiced(vad, raw: bytes) -> bool:
         voiced = 0
         for i in range(VAD_FRAMES_PER_CHUNK):
             frame = raw[i * VAD_FRAME_BYTES:(i + 1) * VAD_FRAME_BYTES]
@@ -125,7 +136,7 @@ class TailRecognizer:
 
         while True:
             raw = read_chunk()
-            voiced = self._chunk_is_voiced(vad, raw)
+            voiced = self.chunk_is_voiced(vad, raw)
 
             if not speech_started:
                 if voiced:

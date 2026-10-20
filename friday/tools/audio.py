@@ -60,7 +60,7 @@ def _record_and_analyze(duration_sec: int) -> str:
     b64_data = base64.b64encode(audio_data).decode("utf-8")
     api_key = os.getenv("GOOGLE_API_KEY")
     # Using Gemini 2.5 Flash for fast multimodal audio reasoning
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
     
     payload = {
         "contents": [{
@@ -75,7 +75,8 @@ def _record_and_analyze(duration_sec: int) -> str:
     }
     
     try:
-        response = httpx.post(url, json=payload, timeout=30.0)
+        # Key in a header, not the URL: httpx logs request URLs.
+        response = httpx.post(url, json=payload, headers={"x-goog-api-key": api_key}, timeout=30.0)
         response.raise_for_status()
         result = response.json()["candidates"][0]["content"]["parts"][0]["text"]
         return result.strip()

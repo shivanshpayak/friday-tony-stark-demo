@@ -38,7 +38,7 @@ CASES = [
     ("open_chrome", T, "Open Chrome.", {"launch_app"}),
     ("open_youtube", T, "Open YouTube.", {"open_on_screen", "launch_app"}),
     ("close_spotify", T, "Close Spotify.", {"close_app"}),
-    ("play_song", T, "Play Havana by Camila Cabello.", {"search_spotify"}),
+    ("play_song", T, "Play Havana by Camila Cabello.", {"play_music"}),
     ("play_spotify_vague", C, "Can you play some Spotify for me?", None),
     ("pause", T, "Pause the music.", {"play_pause_media"}),
     ("skip", T, "Skip.", {"next_track"}),
@@ -84,7 +84,7 @@ CASES = [
     ("after_calc", A, after("What's 17 percent of 2,340?", "", "calculate", {"expression": "0.17*2340"}, "397.8"), "speak"),
     ("after_search", A, after("What's the general price of a Steam Deck?", "", "search_web", {"query": "Steam Deck price"},
         "1. Steam Deck LCD 256GB: $399. Steam Deck OLED 512GB: $549, 1TB: $649 (store.steampowered.com)\n2. Valve keeps Steam Deck pricing unchanged in 2026 (theverge.com)"), "speak"),
-    ("after_spotify", A, after("Play Havana.", "Pulling up Havana, sir.", "search_spotify", {"query": "Havana", "type": "track"}, "Pulled up the track, sir — hit play when ready."), "any"),
+    ("after_spotify", A, after("Play Havana.", "Playing Havana, sir.", "play_music", {"query": "Havana", "type": "track"}, "Playing Havana by Camila Cabello."), "any"),
 ]
 
 async def load_tools():
@@ -141,7 +141,7 @@ async def one(model, system, tools, kind, payload):
                 ptok=getattr(usage, "prompt_tokens", None), ctok=getattr(usage, "completion_tokens", None))
 
 BANNED = re.compile(r"great question|absolutely|of course|sure thing|happy to help|as an ai|language model|[*`#]|!", re.I)
-def payload_ok_tool(r): return r["calls"][0][0] in ("search_spotify", "play_pause_media", "launch_app")
+def payload_ok_tool(r): return r["calls"][0][0] in ("play_music", "play_pause_media", "launch_app")
 def grade(kind, expect, r):
     """-> (ok, notes)"""
     notes = []

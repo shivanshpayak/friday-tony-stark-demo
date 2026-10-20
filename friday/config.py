@@ -31,8 +31,13 @@ STT_TIMEOUT   = 15.0
 # gives it. Once the transcript has gone this many seconds without changing,
 # the turn ends anyway (friday/turn_end.py). Long enough to cover the gap
 # between Deepgram's interim results mid-sentence; in a quiet room Deepgram's
-# own endpoint still gets there first.
-STT_WORD_SILENCE_END = 1.0
+# own endpoint still gets there first. 1.0 cut him off while he thought of the
+# next word ("Keep skipping" | "until you get to" | "attractive by Jordan").
+STT_WORD_SILENCE_END = 1.3
+# ...and this long when the words so far stop on one that leaves the sentence
+# hanging ("Play", "until you get to", "the song that goes like"): he is still
+# thinking. Deepgram's endpoint waits for it too (friday/turn_end.py).
+STT_UNFINISHED_SILENCE_END = 2.5
 
 # --- LLM retry budget ---
 # Gemini answers with an EMPTY completion when it has nothing to say (e.g. after
@@ -122,7 +127,7 @@ TASK_SLOW_THRESHOLD_SECONDS = 1.5
 TASK_LONG_THRESHOLD_SECONDS = 5.0
 
 # ---------------------------------------------------------------------------
-# Scheduling (timers + reminders)
+# Scheduling (timers, reminders, alarms)
 # ---------------------------------------------------------------------------
 
 SCHEDULED_STORE_PATH = Path(__file__).parents[1] / "runtime" / "scheduled.json"
@@ -133,6 +138,13 @@ SCHEDULER_TICK_SECONDS = 1.0
 # playlist put on. The default is Spotify's own "lofi beats".
 FOCUS_CLOSE_APPS = ("discord",)
 FOCUS_PLAYLIST = "spotify:playlist:37i9dQZF1DWWQRwui0ExPn"
+
+# Phone (friday/phone.py). PHONE_NAME picks the device send_to_phone uses, by
+# part of its KDE Connect name, when more than one is paired; empty means the
+# paired phone. "Find my phone" opens PHONE_FIND_URL; for an Android phone use
+# https://www.google.com/android/find.
+PHONE_NAME = ""
+PHONE_FIND_URL = "https://www.icloud.com/find"
 
 # ---------------------------------------------------------------------------
 # Learned Web Automation Context
@@ -414,6 +426,47 @@ DISMISSAL_PHRASES = [
     "dismissed",
     "kill yourself",
 ]
+
+# ---------------------------------------------------------------------------
+# Alarm — a timer going off while JARVIS is idle (friday/alarm.py)
+# ---------------------------------------------------------------------------
+
+# After the timer's line is spoken, a dim chime loops until the launcher's
+# offline recognizer hears one of these; nothing else is taken as input while
+# it rings. Matched as whole words, so "okay stop" and "jarvis stop" both hit
+# "stop". Every word must be in the Vosk model's vocabulary
+# (tests/test_fastpath_vocabulary.py): it has no "that'll", so that phrase is
+# spelled out — Vosk hears "that'll" as "that will" anyway.
+ALARM_STOP_PHRASES = list(dict.fromkeys(
+    [p.replace("that'll", "that will") for p in DISMISSAL_PHRASES]
+    + ["stop", "thank you", "thanks", "got it", "shut up", "turn it off",
+       "enough", "cancel"]
+))
+
+# Peak loudness of the chime, as a fraction of full scale. Kept low on purpose:
+# a soft background ring, not a phone alarm.
+ALARM_VOLUME = 0.2
+
+# While it rings, everything else playing (music, a video) drops to this
+# fraction of its volume, and comes back when it stops. JARVIS's voice is spared.
+ALARM_DUCK_TO = 0.25
+
+# Unanswered this long, the alarm stops by itself and leaves a notification.
+ALARM_MAX_SECONDS = 300
+
+# A timer this overdue when it fires (JARVIS was off when it came due) is said
+# once, not rung — nobody wants yesterday's pasta timer ringing at boot.
+ALARM_STALE_SECONDS = 60
+
+# A clock alarm (set_alarm) this overdue — the laptop was asleep or JARVIS off
+# when it came due — is skipped silently, as in Windows Clock: "first period's
+# over" at 5 PM helps nobody. A repeating one still rings on its next day.
+ALARM_MISSED_SECONDS = 300
+
+# Said while it rings, this puts it off for ALARM_SNOOZE_MINUTES instead of
+# stopping it (same Vosk vocabulary rule as the stop phrases).
+ALARM_SNOOZE_PHRASES = ["snooze"]
+ALARM_SNOOZE_MINUTES = 10
 
 SLEEP_RESPONSES = [
     "Standing watch.",

@@ -140,7 +140,7 @@ Current modules:
 - `system.py` — `get_current_time`, `get_system_info`
 - `apps.py` — `launch_app`, `close_app`, `rescan_apps`
 - `utils.py` — `format_json`, `word_count`
-- `media.py` — `play_pause_media`, `next_track`, `previous_track`, `search_spotify` (tracks, playlists, albums), `set_volume` (master + per-app via pycaw)
+- `media.py` — `play_pause_media`, `next_track`, `previous_track`, `play_music` (Spotify Web API via `friday/spotify.py`: tracks, playlists, albums, artists; lyrics → song via `friday/lyrics.py`), `queue_song`, `like_current_song`, `current_track`, `set_volume` (master + per-app via pycaw)
 - `files.py` — `list_files`, `read_file`, `search_files` (bounded by `FRIDAY_FILE_ROOTS`)
 - `audio.py` — `recognize_song_humming` (Gemini multimodal, records mic then identifies)
 - `messaging.py` — `draft_message` (WhatsApp URI / Discord clipboard+open)
